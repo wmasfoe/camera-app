@@ -4,7 +4,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import uniffi.camera_shared_core.CameraError
+import uniffi.camera_shared_core.CameraException
 import uniffi.camera_shared_core.FilterType
 import uniffi.camera_shared_core.ImageProcessor
 
@@ -72,7 +72,7 @@ object RustBridge {
             )
             val result = processor.applyFilter(imageBytes, filter)
             Result.success(result)
-        } catch (e: CameraError) {
+        } catch (e: CameraException) {
             Result.failure(RuntimeException("Camera error: $e"))
         } catch (e: Throwable) {
             Result.failure(e)
@@ -90,7 +90,7 @@ object RustBridge {
                 )
                 val result = processor.autoEnhance(imageBytes)
                 Result.success(result)
-            } catch (e: CameraError) {
+            } catch (e: CameraException) {
                 Result.failure(RuntimeException("Camera error: $e"))
             } catch (e: Throwable) {
                 Result.failure(e)
@@ -108,7 +108,7 @@ object RustBridge {
                 )
                 val result = processor.compress(imageBytes, quality)
                 Result.success(result)
-            } catch (e: CameraError) {
+            } catch (e: CameraException) {
                 Result.failure(RuntimeException("Camera error: $e"))
             } catch (e: Throwable) {
                 Result.failure(e)

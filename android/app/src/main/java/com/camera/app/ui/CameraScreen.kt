@@ -10,6 +10,10 @@ import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.ImageProxy
+import android.graphics.ImageFormat
+import android.graphics.Rect
+import android.graphics.YuvImage
+import java.io.ByteArrayOutputStream
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
@@ -99,7 +103,7 @@ fun CameraScreen() {
             captureExecutor,
             object : ImageCapture.OnImageCapturedCallback() {
                 override fun onCaptureSuccess(image: ImageProxy) {
-                    val jpegBytes = image.toJpegBytes()
+                    val jpegBytes = imageProxyToJpegBytes(image)
                     image.close()
 
                     scope.launch {
@@ -478,6 +482,37 @@ private fun ReviewControls(
             }
         }
     }
+}
+
+// ── ImageProxy → JPEG 转换 ──────────────────────────────────────────
+
+private fun imageProxyToJpegBytes(image: ImageProxy): ByteArray {
+    // 尝试直接获取 JPEG (CameraX JPEG 模式)
+    if (image.format == ImageFormat.JPEG) {
+        val buffer = image.planes[0].buffer
+        val bytes = ByteArray(buffer.remaining())
+        buffer.get(bytes)
+        return bytes
+    }
+
+    // YUV 模式：通过 YuvImage 转换
+    val yBuffer = image.planes[0].buffer
+    val uBuffer = image.planes[1].buffer
+    val vBuffer = image.planes[2].buffer
+
+    val ySize = yBuffer.remaining()
+    val uSize = uBuffer.remaining()
+    val vSize = vBuffer.remaining()
+
+    val nv21 = ByteArray(ySize + uSize + vSize)
+    yBuffer.get(nv21, 0, ySize)
+    vBuffer.get(nv21, ySize, vSize)
+    uBuffer.get(nv21, ySize + vSize, uSize)
+
+    val yuvImage = YuvImage(nv21, ImageFormat.NV21, image.width, image.height, null)
+    val out = ByteArrayOutputStream()
+    yuvImage.compressToJpeg(Rect(0, 0, image.width, image.height), 95, out)
+    return out.toByteArray()
 }
 
 // ── CameraPreviewView ────────────────────────────────────────────────
