@@ -3,6 +3,9 @@ package com.camera.app.ui
 import android.Manifest
 import android.content.pm.PackageManager
 import android.graphics.BitmapFactory
+import android.graphics.ImageFormat
+import android.graphics.Rect
+import android.graphics.YuvImage
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -10,20 +13,14 @@ import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.ImageProxy
-import android.graphics.ImageFormat
-import android.graphics.Rect
-import android.graphics.YuvImage
-import java.io.ByteArrayOutputStream
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
@@ -47,6 +44,7 @@ import com.camera.app.bridge.PhotoSaver
 import com.camera.app.bridge.RustBridge
 import kotlinx.coroutines.launch
 import uniffi.camera_shared_core.FilterType
+import java.io.ByteArrayOutputStream
 import java.util.concurrent.Executors
 
 // ── Design Tokens ────────────────────────────────────────────────────
@@ -64,6 +62,7 @@ private val AccentDim = Color(0xFF636366)
 fun CameraScreen() {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    val lifecycleOwner = LocalLifecycleOwner.current
 
     var hasCameraPermission by remember {
         mutableStateOf(
@@ -72,15 +71,19 @@ fun CameraScreen() {
         )
     }
 
+    // 状态
     var capturedBytes by remember { mutableStateOf<ByteArray?>(null) }
     var processedBytes by remember { mutableStateOf<ByteArray?>(null) }
     var selectedFilter by remember { mutableStateOf(FilterType.NONE) }
     var isProcessing by remember { mutableStateOf(false) }
+    var isFrontCamera by remember { mutableStateOf(false) }
+    var flashMode by remember { mutableIntStateOf(ImageCapture.FLASH_MODE_AUTO) }
+    var selectedMode by remember { mutableIntStateOf(1) } // 0=Video, 1=Photo, 2=Portrait
 
     val imageCapture = remember {
         ImageCapture.Builder()
             .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
-            .setFlashMode(ImageCapture.FLASH_MODE_AUTO)
+            .setFlashMode(flashMode)
             .build()
     }
 
@@ -98,6 +101,7 @@ fun CameraScreen() {
         }
     }
 
+    // 拍照
     fun takePhoto() {
         imageCapture.takePicture(
             captureExecutor,
@@ -126,6 +130,7 @@ fun CameraScreen() {
         )
     }
 
+    // 应用滤镜
     fun applyFilter(filter: FilterType) {
         val bytes = capturedBytes ?: return
         selectedFilter = filter
@@ -143,13 +148,51 @@ fun CameraScreen() {
         }
     }
 
+    // 重拍
+    fun retake() {
+        capturedBytes = null
+        processedBytes = null
+        selectedFilter = FilterType.NONE
+    }
+
+    // 保存
+    fun save() {
+        val bytes = processedBytes ?: return
+        scope.launch {
+            val uri = PhotoSaver.saveJpegToGallery(context, bytes)
+            if (uri != null) {
+                Toast.makeText(context, "Saved", Toast.LENGTH_SHORT).show()
+                retake()
+            } else {
+                Toast.makeText(context, "Failed", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    // 切换闪光模式
+    fun toggleFlash() {
+        flashMode = when (flashMode) {
+            ImageCapture.FLASH_MODE_AUTO -> ImageCapture.FLASH_MODE_ON
+            ImageCapture.FLASH_MODE_ON -> ImageCapture.FLASH_MODE_OFF
+            else -> ImageCapture.FLASH_MODE_AUTO
+        }
+        imageCapture.flashMode = flashMode
+    }
+
+    // 切换前后摄像头
+    fun switchCamera() {
+        isFrontCamera = !isFrontCamera
+    }
+
+    // ── UI ──
+
     Box(
         modifier = Modifier
             .fillMaxSize()
             .background(Bg)
     ) {
         if (!hasCameraPermission) {
-            // ── 无权限 ──
+            // 无权限
             Column(
                 modifier = Modifier.align(Alignment.Center),
                 horizontalAlignment = Alignment.CenterHorizontally,
@@ -179,97 +222,73 @@ fun CameraScreen() {
             return@Box
         }
 
-        // ── 取景器 ──
-        AnimatedVisibility(
-            visible = processedBytes == null,
-            enter = fadeIn(),
-            exit = fadeOut()
-        ) {
-            Box(modifier = Modifier.fillMaxSize()) {
-                CameraPreviewView(
-                    imageCapture = imageCapture,
+        if (processedBytes != null) {
+            // ── Review 界面 ──
+            val bitmap = remember(processedBytes) {
+                processedBytes?.let {
+                    BitmapFactory.decodeByteArray(it, 0, it.size)
+                }
+            }
+
+            bitmap?.let {
+                Image(
+                    bitmap = it.asImageBitmap(),
+                    contentDescription = null,
                     modifier = Modifier.fillMaxSize()
                 )
+            }
 
-                // 顶部工具栏
-                TopBar(
+            // 处理中
+            if (isProcessing) {
+                ProcessingBadge(
                     modifier = Modifier
-                        .align(Alignment.TopStart)
+                        .align(Alignment.TopCenter)
                         .statusBarsPadding()
-                        .padding(horizontal = 16.dp, vertical = 8.dp)
-                )
-
-                // 底部控制
-                ViewfinderControls(
-                    onShutter = { takePhoto() },
-                    modifier = Modifier
-                        .align(Alignment.BottomStart)
-                        .navigationBarsPadding()
-                        .padding(bottom = 24.dp)
+                        .padding(top = 12.dp)
                 )
             }
-        }
 
-        // ── 拍照后 / 滤镜 ──
-        AnimatedVisibility(
-            visible = processedBytes != null,
-            enter = fadeIn(),
-            exit = fadeOut()
-        ) {
-            Box(modifier = Modifier.fillMaxSize()) {
-                // 图片
-                val bitmap = remember(processedBytes) {
-                    processedBytes?.let {
-                        BitmapFactory.decodeByteArray(it, 0, it.size)
-                    }
-                }
+            // 底部：滤镜 + 操作
+            ReviewControls(
+                selectedFilter = selectedFilter,
+                onSelectFilter = { applyFilter(it) },
+                onRetake = { retake() },
+                onSave = { save() },
+                modifier = Modifier
+                    .align(Alignment.BottomStart)
+                    .navigationBarsPadding()
+                    .padding(bottom = 24.dp)
+            )
 
-                bitmap?.let {
-                    Image(
-                        bitmap = it.asImageBitmap(),
-                        contentDescription = null,
-                        modifier = Modifier.fillMaxSize()
-                    )
-                }
+        } else {
+            // ── 取景器 ──
+            CameraPreviewView(
+                imageCapture = imageCapture,
+                isFrontCamera = isFrontCamera,
+                modifier = Modifier.fillMaxSize()
+            )
 
-                // 处理中
-                if (isProcessing) {
-                    ProcessingBadge(
-                        modifier = Modifier
-                            .align(Alignment.TopCenter)
-                            .statusBarsPadding()
-                            .padding(top = 12.dp)
-                    )
-                }
+            // 顶部工具栏
+            TopBar(
+                flashMode = flashMode,
+                onFlashToggle = { toggleFlash() },
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .statusBarsPadding()
+                    .padding(horizontal = 16.dp, vertical = 8.dp)
+            )
 
-                // 底部：滤镜 + 操作
-                ReviewControls(
-                    selectedFilter = selectedFilter,
-                    onSelectFilter = { applyFilter(it) },
-                    onRetake = {
-                        capturedBytes = null
-                        processedBytes = null
-                        selectedFilter = FilterType.NONE
-                    },
-                    onSave = {
-                        val bytes = processedBytes
-                        if (bytes != null) {
-                            scope.launch {
-                                val uri = PhotoSaver.saveJpegToGallery(context, bytes)
-                                if (uri != null) {
-                                    Toast.makeText(context, "Saved", Toast.LENGTH_SHORT).show()
-                                } else {
-                                    Toast.makeText(context, "Failed", Toast.LENGTH_SHORT).show()
-                                }
-                            }
-                        }
-                    },
-                    modifier = Modifier
-                        .align(Alignment.BottomStart)
-                        .navigationBarsPadding()
-                        .padding(bottom = 24.dp)
-                )
-            }
+            // 底部控制
+            ViewfinderControls(
+                selectedMode = selectedMode,
+                onModeChange = { selectedMode = it },
+                onShutter = { takePhoto() },
+                onSwitchCamera = { switchCamera() },
+                modifier = Modifier
+                    .align(Alignment.BottomStart)
+                    .navigationBarsPadding()
+                    .padding(bottom = 24.dp)
+            )
         }
     }
 }
@@ -277,21 +296,28 @@ fun CameraScreen() {
 // ── TopBar ───────────────────────────────────────────────────────────
 
 @Composable
-private fun TopBar(modifier: Modifier = Modifier) {
+private fun TopBar(
+    flashMode: Int,
+    onFlashToggle: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val flashLabel = when (flashMode) {
+        ImageCapture.FLASH_MODE_ON -> "ON"
+        ImageCapture.FLASH_MODE_OFF -> "OFF"
+        else -> "A"
+    }
+
     Row(
         modifier = modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically
     ) {
         // 闪光
-        IconButton(
-            onClick = { /* TODO */ },
-            modifier = Modifier
-                .size(36.dp)
-                .background(Surface2.copy(alpha = 0.6f), CircleShape)
-        ) {
-            Text("A", color = TextMuted, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
-        }
+        CircleTextButton(
+            label = flashLabel,
+            textColor = if (flashMode == ImageCapture.FLASH_MODE_OFF) AccentDim else TextMuted,
+            onClick = onFlashToggle
+        )
 
         // AUTO 标签
         Text(
@@ -306,14 +332,7 @@ private fun TopBar(modifier: Modifier = Modifier) {
         )
 
         // 曝光
-        IconButton(
-            onClick = { /* TODO */ },
-            modifier = Modifier
-                .size(36.dp)
-                .background(Surface2.copy(alpha = 0.6f), CircleShape)
-        ) {
-            Text("EV", color = TextMuted, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
-        }
+        CircleTextButton(label = "EV", textColor = TextMuted, onClick = { /* TODO */ })
     }
 }
 
@@ -321,9 +340,14 @@ private fun TopBar(modifier: Modifier = Modifier) {
 
 @Composable
 private fun ViewfinderControls(
+    selectedMode: Int,
+    onModeChange: (Int) -> Unit,
     onShutter: () -> Unit,
+    onSwitchCamera: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val modes = listOf("Video", "Photo", "Portrait")
+
     Column(
         modifier = modifier.fillMaxWidth(),
         horizontalAlignment = Alignment.CenterHorizontally
@@ -333,13 +357,17 @@ private fun ViewfinderControls(
             horizontalArrangement = Arrangement.spacedBy(20.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            listOf("Video", "Photo", "Portrait").forEachIndexed { index, label ->
+            modes.forEachIndexed { index, label ->
                 Text(
                     label.uppercase(),
-                    color = if (index == 1) TextPrimary else TextMuted,
+                    color = if (index == selectedMode) TextPrimary else TextMuted,
                     fontSize = 12.sp,
                     fontWeight = FontWeight.Medium,
-                    letterSpacing = 0.3.sp
+                    letterSpacing = 0.3.sp,
+                    modifier = Modifier.clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null
+                    ) { onModeChange(index) }
                 )
             }
         }
@@ -353,21 +381,17 @@ private fun ViewfinderControls(
             verticalAlignment = Alignment.CenterVertically
         ) {
             // 相册
-            IconButton(
-                onClick = { /* TODO */ },
-                modifier = Modifier
-                    .size(42.dp)
-                    .background(Surface2.copy(alpha = 0.4f), CircleShape)
-            ) {
-                Text("G", color = TextPrimary, fontSize = 14.sp, fontWeight = FontWeight.Medium)
-            }
+            CircleTextButton(label = "G", textColor = TextPrimary, onClick = { /* TODO */ })
 
             // 快门按钮
             Box(
                 modifier = Modifier
                     .size(72.dp)
                     .border(3.dp, TextPrimary, CircleShape)
-                    .clickable { onShutter() },
+                    .clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null
+                    ) { onShutter() },
                 contentAlignment = Alignment.Center
             ) {
                 Box(
@@ -378,15 +402,36 @@ private fun ViewfinderControls(
             }
 
             // 翻转摄像头
-            IconButton(
-                onClick = { /* TODO */ },
-                modifier = Modifier
-                    .size(42.dp)
-                    .background(Surface2.copy(alpha = 0.4f), CircleShape)
-            ) {
-                Text("R", color = TextPrimary, fontSize = 14.sp, fontWeight = FontWeight.Medium)
-            }
+            CircleTextButton(label = "R", textColor = TextPrimary, onClick = onSwitchCamera)
         }
+    }
+}
+
+// ── 通用圆形文字按钮 ────────────────────────────────────────────────
+
+@Composable
+private fun CircleTextButton(
+    label: String,
+    textColor: Color,
+    size: Int = 36,
+    onClick: () -> Unit
+) {
+    Box(
+        modifier = Modifier
+            .size(size.dp)
+            .background(Surface2.copy(alpha = 0.6f), CircleShape)
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null
+            ) { onClick() },
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            label,
+            color = textColor,
+            fontSize = if (label.length > 1) 11.sp else 13.sp,
+            fontWeight = FontWeight.SemiBold
+        )
     }
 }
 
@@ -445,7 +490,10 @@ private fun ReviewControls(
                                 RoundedCornerShape(14.dp)
                             ) else Modifier
                         )
-                        .clickable { onSelectFilter(filter) }
+                        .clickable(
+                            interactionSource = remember { MutableInteractionSource() },
+                            indication = null
+                        ) { onSelectFilter(filter) }
                         .padding(horizontal = 14.dp, vertical = 6.dp)
                 )
             }
@@ -487,7 +535,6 @@ private fun ReviewControls(
 // ── ImageProxy → JPEG 转换 ──────────────────────────────────────────
 
 private fun imageProxyToJpegBytes(image: ImageProxy): ByteArray {
-    // 尝试直接获取 JPEG (CameraX JPEG 模式)
     if (image.format == ImageFormat.JPEG) {
         val buffer = image.planes[0].buffer
         val bytes = ByteArray(buffer.remaining())
@@ -495,7 +542,6 @@ private fun imageProxyToJpegBytes(image: ImageProxy): ByteArray {
         return bytes
     }
 
-    // YUV 模式：通过 YuvImage 转换
     val yBuffer = image.planes[0].buffer
     val uBuffer = image.planes[1].buffer
     val vBuffer = image.planes[2].buffer
@@ -520,6 +566,7 @@ private fun imageProxyToJpegBytes(image: ImageProxy): ByteArray {
 @Composable
 fun CameraPreviewView(
     imageCapture: ImageCapture,
+    isFrontCamera: Boolean,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -540,7 +587,11 @@ fun CameraPreviewView(
                     it.surfaceProvider = previewView.surfaceProvider
                 }
 
-                val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
+                val cameraSelector = if (isFrontCamera) {
+                    CameraSelector.DEFAULT_FRONT_CAMERA
+                } else {
+                    CameraSelector.DEFAULT_BACK_CAMERA
+                }
 
                 try {
                     cameraProvider.unbindAll()
