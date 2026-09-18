@@ -1,0 +1,127 @@
+/*
+ * UniFFI 接口定义 — camera-app 共享核心
+ * 定义 Rust 暴露给 Kotlin/Swift 的所有类型和函数
+ */
+
+namespace camera_shared_core {
+    string get_version();
+    string get_platform_info();
+};
+
+/* ==================== 枚举 ==================== */
+
+enum FlashMode {
+    "Off",
+    "On",
+    "Auto",
+    "Torch",
+};
+
+enum CameraFacing {
+    "Back",
+    "Front",
+};
+
+enum FilterType {
+    "None",
+    "Vivid",
+    "Warm",
+    "Cool",
+    "Noir",
+    "Fade",
+};
+
+enum CaptureMode {
+    "Photo",
+    "Video",
+    "Portrait",
+    "Night",
+};
+
+/* ==================== 数据结构 ==================== */
+
+dictionary CameraConfig {
+    u32 width;
+    u32 height;
+    u32 fps;
+    FlashMode flash;
+    CameraFacing facing;
+    CaptureMode mode;
+    boolean enable_hdr;
+    float zoom;
+};
+
+dictionary CaptureResult {
+    string file_path;
+    u32 width;
+    u32 height;
+    u64 file_size;
+    i64 timestamp;
+    boolean is_front_camera;
+    FlashMode flash_used;
+    float zoom_used;
+};
+
+dictionary AppSettings {
+    string default_save_path;
+    boolean save_location;
+    string photo_format;
+    u32 jpeg_quality;
+    boolean mirror_front_camera;
+    FilterType default_filter;
+    boolean shutter_sound;
+    boolean grid_lines;
+    boolean location_tag;
+};
+
+dictionary ProcessedInfo {
+    string file_path;
+    u32 width;
+    u32 height;
+    u64 file_size;
+    string filter_applied;
+    float processing_time_ms;
+};
+
+/* ==================== 错误 ==================== */
+
+[Error]
+enum CameraError {
+    "DeviceNotFound",
+    "PermissionDenied",
+    "CaptureFailed",
+    "ProcessingFailed",
+    "InvalidConfig",
+    "StorageError",
+    "Unknown",
+};
+
+/* ==================== 接口 ==================== */
+
+interface ImageProcessor {
+    constructor();
+
+    [Throws=CameraError]
+    bytes apply_filter(bytes input_image, FilterType filter);
+
+    [Throws=CameraError]
+    bytes auto_enhance(bytes input_image);
+
+    [Throws=CameraError]
+    bytes compress(bytes input_image, u32 quality);
+
+    sequence<FilterType> supported_filters();
+
+    string filter_name(FilterType filter);
+};
+
+interface SettingsManager {
+    constructor(string config_path);
+
+    AppSettings load();
+
+    [Throws=CameraError]
+    void save(AppSettings settings);
+
+    AppSettings reset_to_default();
+};
