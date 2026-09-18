@@ -1,9 +1,9 @@
-name: Release Alpha
+name: Release
 
 on:
   push:
     tags:
-      - "v*-alpha*"
+      - "v*"
 
 env:
   CARGO_TERM_COLOR: always
@@ -108,30 +108,25 @@ jobs:
         id: version
         run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
 
+      - name: Check if prerelease
+        id: prerelease
+        run: |
+          if echo "${{ steps.version.outputs.VERSION }}" | grep -qE "alpha|beta|rc"; then
+            echo "IS_PRERELEASE=true" >> $GITHUB_OUTPUT
+          else
+            echo "IS_PRERELEASE=false" >> $GITHUB_OUTPUT
+          fi
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           name: "Camera App ${{ steps.version.outputs.VERSION }}"
-          prerelease: true
+          prerelease: ${{ steps.prerelease.outputs.IS_PRERELEASE }}
           generate_release_notes: true
           files: |
             android/app/build/outputs/apk/release/*.apk
           body: |
-            ## Alpha Release
-
-            **This is an early alpha build.** Expect bugs and missing features.
-
-            ### What's included
-            - Camera preview (Android)
-            - Photo capture
-            - Rust-powered image filters (Vivid, Warm, Cool, Noir, Fade)
-            - Auto-enhance
-            - Save to gallery
-
-            ### Architecture
-            - Rust shared core (UniFFI) — image processing, settings
-            - Android native UI (Compose + CameraX)
-            - iOS native UI (SwiftUI + AVFoundation) — coming soon
+            ## ${{ steps.version.outputs.VERSION }}
 
             ### Install
             Download the APK below and install on your Android device.
