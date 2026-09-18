@@ -3,6 +3,7 @@ package com.camera.app.ui
 import android.Manifest
 import android.content.pm.PackageManager
 import android.graphics.BitmapFactory
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.CameraSelector
@@ -29,6 +30,7 @@ import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import com.camera.app.bridge.PhotoSaver
 import com.camera.app.bridge.RustBridge
 import kotlinx.coroutines.launch
 import uniffi.camera_shared_core.FilterType
@@ -210,7 +212,17 @@ fun CameraScreen() {
                     // 保存按钮
                     Button(
                         onClick = {
-                            // TODO: 保存到相册
+                            val bytes = processedBytes
+                            if (bytes != null) {
+                                scope.launch {
+                                    val uri = PhotoSaver.saveJpegToGallery(context, bytes)
+                                    if (uri != null) {
+                                        Toast.makeText(context, "已保存到相册", Toast.LENGTH_SHORT).show()
+                                    } else {
+                                        Toast.makeText(context, "保存失败", Toast.LENGTH_SHORT).show()
+                                    }
+                                }
+                            }
                         },
                         colors = ButtonDefaults.buttonColors(
                             containerColor = Color.White
