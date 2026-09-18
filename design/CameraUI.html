@@ -1,0 +1,663 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scale=no">
+<title>Camera App — UI Design</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  :root {
+    --bg: #000;
+    --surface: #1a1a1a;
+    --surface-2: #252525;
+    --text: #fff;
+    --text-muted: #8e8e93;
+    --accent: #e8e8e8;
+    --accent-dim: #636366;
+    --shutter-ring: #fff;
+    --shutter-inner: #fff;
+    --danger: #ff453a;
+    --safe: #30d158;
+  }
+
+  body {
+    font-family: -apple-system, "SF Pro Text", "Helvetica Neue", sans-serif;
+    background: #111;
+    color: var(--text);
+    display: flex;
+    justify-content: center;
+    align-items: flex-start;
+    min-height: 100vh;
+    padding: 24px 0;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .phone-frame {
+    width: 375px;
+    height: 812px;
+    background: var(--bg);
+    border-radius: 40px;
+    overflow: hidden;
+    position: relative;
+    box-shadow: 0 0 0 2px #333, 0 20px 60px rgba(0,0,0,.5);
+  }
+
+  /* ===== 状态: 取景器 ===== */
+
+  .viewfinder {
+    position: absolute;
+    inset: 0;
+    background:
+      linear-gradient(180deg, rgba(0,0,0,.15) 0%, transparent 15%),
+      linear-gradient(0deg, rgba(0,0,0,.4) 0%, transparent 30%),
+      #1a1a1a;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .viewfinder-frame {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: relative;
+  }
+
+  .viewfinder-placeholder {
+    width: 100%;
+    height: 100%;
+    background:
+      radial-gradient(ellipse at center, #2a2a2a 0%, #111 100%);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .viewfinder-placeholder span {
+    color: var(--accent-dim);
+    font-size: 13px;
+    letter-spacing: .5px;
+    text-transform: uppercase;
+  }
+
+  /* 顶部工具栏 */
+  .top-bar {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    padding: 56px 20px 12px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    z-index: 10;
+  }
+
+  .top-btn {
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    background: rgba(0,0,0,.35);
+    backdrop-filter: blur(10px);
+    border: none;
+    color: var(--text);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+  }
+
+  .top-btn svg { width: 18px; height: 18px; }
+
+  .flash-indicator {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: .3px;
+    color: var(--text-muted);
+    background: rgba(0,0,0,.35);
+    backdrop-filter: blur(10px);
+    padding: 4px 10px;
+    border-radius: 12px;
+  }
+
+  /* 底部控制区 */
+  .bottom-bar {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    padding: 0 20px 40px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 20px;
+  }
+
+  /* 模式切换 */
+  .mode-row {
+    display: flex;
+    gap: 20px;
+    align-items: center;
+  }
+
+  .mode-label {
+    font-size: 12px;
+    font-weight: 500;
+    letter-spacing: .3px;
+    color: var(--text-muted);
+    cursor: pointer;
+    transition: color .2s;
+    text-transform: uppercase;
+  }
+
+  .mode-label.active {
+    color: var(--text);
+  }
+
+  /* 快门区 */
+  .shutter-row {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 48px;
+    width: 100%;
+  }
+
+  .shutter-btn {
+    width: 72px;
+    height: 72px;
+    border-radius: 50%;
+    border: 3px solid var(--shutter-ring);
+    background: transparent;
+    position: relative;
+    cursor: pointer;
+    transition: transform .1s;
+  }
+
+  .shutter-btn::after {
+    content: "";
+    position: absolute;
+    inset: 4px;
+    border-radius: 50%;
+    background: var(--shutter-inner);
+    transition: transform .1s;
+  }
+
+  .shutter-btn:active {
+    transform: scale(.92);
+  }
+
+  .shutter-btn:active::after {
+    transform: scale(.9);
+  }
+
+  .side-btn {
+    width: 42px;
+    height: 42px;
+    border-radius: 50%;
+    background: rgba(255,255,255,.1);
+    border: none;
+    color: var(--text);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+  }
+
+  .side-btn svg { width: 20px; height: 20px; }
+
+  /* ===== 状态: 拍照后 / 滤镜选择 ===== */
+
+  .review-screen {
+    position: absolute;
+    inset: 0;
+    background: var(--bg);
+    display: none;
+    flex-direction: column;
+  }
+
+  .review-screen.active { display: flex; }
+
+  .review-image {
+    flex: 1;
+    background: #1a1a1a;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: relative;
+  }
+
+  .review-image img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+
+  .review-image .placeholder-img {
+    width: 100%;
+    height: 100%;
+    background: linear-gradient(135deg, #2a2a2a 0%, #1a1a1a 50%, #2a2a2a 100%);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .placeholder-img span {
+    color: var(--accent-dim);
+    font-size: 13px;
+    letter-spacing: .5px;
+  }
+
+  /* 处理中指示 */
+  .processing-badge {
+    position: absolute;
+    top: 56px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba(0,0,0,.6);
+    backdrop-filter: blur(10px);
+    padding: 6px 14px;
+    border-radius: 14px;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-muted);
+    display: none;
+  }
+
+  .processing-badge.active { display: block; }
+
+  .spinner {
+    display: inline-block;
+    width: 12px;
+    height: 12px;
+    border: 1.5px solid var(--accent-dim);
+    border-top-color: var(--text);
+    border-radius: 50%;
+    animation: spin .8s linear infinite;
+    margin-right: 6px;
+    vertical-align: middle;
+  }
+
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* 滤镜栏 */
+  .filter-bar {
+    padding: 16px 0 8px;
+    overflow-x: auto;
+    display: flex;
+    gap: 10px;
+    padding-left: 20px;
+    padding-right: 20px;
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+
+  .filter-bar::-webkit-scrollbar { display: none; }
+
+  .filter-pill {
+    flex-shrink: 0;
+    padding: 6px 14px;
+    border-radius: 14px;
+    border: 1.5px solid var(--accent-dim);
+    background: transparent;
+    color: var(--text-muted);
+    font-size: 12px;
+    font-weight: 500;
+    letter-spacing: .2px;
+    cursor: pointer;
+    transition: all .15s;
+    white-space: nowrap;
+  }
+
+  .filter-pill:hover {
+    border-color: var(--accent);
+    color: var(--text);
+  }
+
+  .filter-pill.active {
+    background: var(--text);
+    color: var(--bg);
+    border-color: var(--text);
+  }
+
+  /* 底部操作 */
+  .review-actions {
+    padding: 12px 20px 40px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+
+  .btn-secondary {
+    padding: 10px 24px;
+    border-radius: 20px;
+    background: var(--surface-2);
+    border: none;
+    color: var(--text);
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background .15s;
+  }
+
+  .btn-secondary:hover { background: #333; }
+
+  .btn-primary {
+    padding: 10px 28px;
+    border-radius: 20px;
+    background: var(--text);
+    border: none;
+    color: var(--bg);
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: opacity .15s;
+  }
+
+  .btn-primary:hover { opacity: .85; }
+
+  /* ===== 状态切换控件 (原型专用) ===== */
+
+  .proto-controls {
+    position: fixed;
+    bottom: 20px;
+    right: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    z-index: 100;
+  }
+
+  .proto-btn {
+    padding: 8px 14px;
+    border-radius: 8px;
+    border: 1px solid #333;
+    background: #1a1a1a;
+    color: #aaa;
+    font-size: 12px;
+    cursor: pointer;
+    font-family: inherit;
+  }
+
+  .proto-btn:hover { background: #252525; color: #fff; }
+  .proto-btn.active { border-color: #555; color: #fff; }
+
+  /* ===== 标题区 ===== */
+
+  .section-label {
+    position: fixed;
+    top: 20px;
+    left: 50%;
+    transform: translateX(-50%);
+    color: #555;
+    font-size: 11px;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    z-index: 100;
+  }
+
+  /* ===== 说明文字 ===== */
+
+  .design-notes {
+    width: 320px;
+    margin-left: 40px;
+    flex-shrink: 0;
+    padding-top: 60px;
+  }
+
+  .design-notes h2 {
+    font-size: 16px;
+    font-weight: 600;
+    margin-bottom: 16px;
+    color: var(--text);
+  }
+
+  .design-notes h3 {
+    font-size: 13px;
+    font-weight: 600;
+    margin: 16px 0 8px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: .5px;
+  }
+
+  .design-notes p, .design-notes li {
+    font-size: 13px;
+    line-height: 1.6;
+    color: var(--accent-dim);
+  }
+
+  .design-notes ul {
+    padding-left: 16px;
+    margin-bottom: 12px;
+  }
+
+  .design-notes li { margin-bottom: 4px; }
+
+  .color-swatch {
+    display: inline-block;
+    width: 14px;
+    height: 14px;
+    border-radius: 3px;
+    vertical-align: middle;
+    margin-right: 6px;
+    border: 1px solid #333;
+  }
+
+  .token-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 6px;
+    font-size: 12px;
+    color: var(--accent-dim);
+  }
+
+  .token-name {
+    font-family: "SF Mono", "Fira Code", monospace;
+    color: var(--text-muted);
+    min-width: 100px;
+  }
+
+  @media (max-width: 800px) {
+    .design-notes { display: none; }
+    body { padding: 12px; }
+  }
+</style>
+</head>
+<body>
+
+<span class="section-label">Camera App — UI Prototype</span>
+
+<div style="display: flex; justify-content: center; align-items: flex-start;">
+
+<!-- Phone Frame -->
+<div class="phone-frame" id="phone">
+
+  <!-- 状态1: 取景器 -->
+  <div class="viewfinder" id="state-viewfinder">
+    <div class="top-bar">
+      <button class="top-btn">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M13 10V3L4 14h7v7l9-11h-7z"/>
+        </svg>
+      </button>
+      <span class="flash-indicator">AUTO</span>
+      <button class="top-btn">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="3"/><path d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>
+        </svg>
+      </button>
+    </div>
+
+    <div class="viewfinder-frame">
+      <div class="viewfinder-placeholder">
+        <span>Camera Preview</span>
+      </div>
+    </div>
+
+    <div class="bottom-bar">
+      <div class="mode-row">
+        <span class="mode-label">Video</span>
+        <span class="mode-label active">Photo</span>
+        <span class="mode-label">Portrait</span>
+      </div>
+      <div class="shutter-row">
+        <button class="side-btn" id="btn-gallery">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="m21 15-5-5L5 21"/>
+          </svg>
+        </button>
+        <button class="shutter-btn" id="btn-shutter"></button>
+        <button class="side-btn" id="btn-flip">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M1 4v6h6M23 20v-6h-6"/><path d="M20.49 9A9 9 0 0 0 5.64 5.64L1 10m22 4l-4.64 4.36A9 9 0 0 1 3.51 15"/>
+          </svg>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 状态2: 拍照后 / 滤镜选择 -->
+  <div class="review-screen" id="state-review">
+    <div class="review-image">
+      <div class="placeholder-img">
+        <span>Captured Photo</span>
+      </div>
+      <div class="processing-badge" id="processing">
+        <span class="spinner"></span>Processing
+      </div>
+    </div>
+
+    <div class="filter-bar">
+      <button class="filter-pill active" data-filter="none">Original</button>
+      <button class="filter-pill" data-filter="vivid">Vivid</button>
+      <button class="filter-pill" data-filter="warm">Warm</button>
+      <button class="filter-pill" data-filter="cool">Cool</button>
+      <button class="filter-pill" data-filter="noir">Noir</button>
+      <button class="filter-pill" data-filter="fade">Fade</button>
+    </div>
+
+    <div class="review-actions">
+      <button class="btn-secondary" id="btn-retake">Retake</button>
+      <button class="btn-primary" id="btn-save">Save</button>
+    </div>
+  </div>
+
+</div>
+
+<!-- Design Notes -->
+<div class="design-notes">
+  <h2>Design Tokens</h2>
+
+  <h3>Color</h3>
+  <div class="token-row">
+    <span class="color-swatch" style="background:#000"></span>
+    <span class="token-name">--bg</span>
+    <span>#000 — Pure black, OLED-safe</span>
+  </div>
+  <div class="token-row">
+    <span class="color-swatch" style="background:#1a1a1a"></span>
+    <span class="token-name">--surface</span>
+    <span>#1a1a1a — Preview bg</span>
+  </div>
+  <div class="token-row">
+    <span class="color-swatch" style="background:#252525"></span>
+    <span class="token-name">--surface-2</span>
+    <span>#252525 — Button bg</span>
+  </div>
+  <div class="token-row">
+    <span class="color-swatch" style="background:#fff"></span>
+    <span class="token-name">--text</span>
+    <span>#fff — Primary text</span>
+  </div>
+  <div class="token-row">
+    <span class="color-swatch" style="background:#8e8e93"></span>
+    <span class="token-name">--text-muted</span>
+    <span>#8e8e93 — Secondary</span>
+  </div>
+  <div class="token-row">
+    <span class="color-swatch" style="background:#636366"></span>
+    <span class="token-name">--accent-dim</span>
+    <span>#636366 — Borders</span>
+  </div>
+
+  <h3>Typography</h3>
+  <p>System font stack. SF Pro on iOS, Roboto on Android.<br>
+  Sizes: 12px labels, 14px buttons, 16px headings.<br>
+  Weight: 500 medium, 600 semibold.</p>
+
+  <h3>Spacing</h3>
+  <p>Shutter: 72px diameter, 3px ring.<br>
+  Filter pills: 6px 14px padding, 14px radius.<br>
+  Action buttons: 10px 24-28px padding, 20px radius.<br>
+  Bottom safe area: 40px.</p>
+
+  <h3>Principles</h3>
+  <ul>
+    <li>Pure black bg — no gradients on camera surface</li>
+    <li>System fonts only — no custom type</li>
+    <li>No emoji anywhere</li>
+    <li>Minimal chrome — preview fills screen</li>
+    <li>Pill-shaped filters, not chips or cards</li>
+    <li>Shutter uses border+fill, not icon</li>
+    <li>All controls have clear hit states</li>
+  </ul>
+</div>
+
+</div>
+
+<!-- Prototype Controls -->
+<div class="proto-controls">
+  <button class="proto-btn active" onclick="showState('viewfinder')">Viewfinder</button>
+  <button class="proto-btn" onclick="showState('review')">Review + Filters</button>
+  <button class="proto-btn" onclick="toggleProcessing()">Toggle Processing</button>
+</div>
+
+<script>
+  function showState(state) {
+    document.getElementById('state-viewfinder').style.display =
+      state === 'viewfinder' ? 'flex' : 'none';
+    document.getElementById('state-review').className =
+      state === 'review' ? 'review-screen active' : 'review-screen';
+
+    document.querySelectorAll('.proto-btn').forEach(b => b.classList.remove('active'));
+    event.target.classList.add('active');
+  }
+
+  function toggleProcessing() {
+    document.getElementById('processing').classList.toggle('active');
+  }
+
+  // Filter pill interaction
+  document.querySelectorAll('.filter-pill').forEach(pill => {
+    pill.addEventListener('click', () => {
+      document.querySelectorAll('.filter-pill').forEach(p => p.classList.remove('active'));
+      pill.classList.add('active');
+    });
+  });
+
+  // Shutter animation
+  document.getElementById('btn-shutter').addEventListener('click', () => {
+    const phone = document.getElementById('phone');
+    phone.style.transition = 'opacity .08s';
+    phone.style.opacity = '0.3';
+    setTimeout(() => {
+      phone.style.opacity = '1';
+      showState('review');
+      document.querySelectorAll('.proto-btn').forEach(b => b.classList.remove('active'));
+      document.querySelectorAll('.proto-btn')[1].classList.add('active');
+    }, 150);
+  });
+
+  // Retake
+  document.getElementById('btn-retake').addEventListener('click', () => {
+    showState('viewfinder');
+    document.querySelectorAll('.proto-btn').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.proto-btn')[0].classList.add('active');
+  });
+</script>
+
+</body>
+</html>
