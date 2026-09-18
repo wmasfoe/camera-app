@@ -1,0 +1,7 @@
+# Rust 交叉编译配置
+# 在有 Android NDK 的机器上，取消注释并设置正确路径
+# 或者使用 cargo-ndk: cargo ndk -t arm64-v8a build --release
+
+# [target.aarch64-linux-android]
+# linker = "$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
+# ar = "$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"

@@ -57,4 +57,7 @@ dependencies {
 
     // Coroutines
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
+
+    // JNA — UniFFI 生成的 Kotlin 绑定需要
+    implementation("net.java.dev.jna:jna:5.17.0@aar")
 }

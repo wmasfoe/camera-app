@@ -25,6 +25,8 @@ ios/Pods/
 .DS_Store
 Thumbs.db
 
-# Generated bindings
-android/app/src/main/java/uniffi/
+# jniLibs 里的 .so 由构建系统生成，不提交
+android/app/src/main/jniLibs/
+
+# iOS 生成的绑定
 ios/CameraApp/Generated/

@@ -8,9 +8,14 @@ description = "Shared core library for camera app — Rust + UniFFI"
 crate-type = ["cdylib", "staticlib"]
 name = "camera_shared_core"
 
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/uniffi-bindgen.rs"
+
 [dependencies]
 # UniFFI — 自动生成 Kotlin/Swift 绑定
 uniffi = { version = "0.28", features = ["cli"] }
+uniffi_bindgen = "0.28"
 
 # 序列化
 serde = { version = "1", features = ["derive"] }
