@@ -1,0 +1,150 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  ANDROID_NDK_VERSION: "27.2.12479018"
+
+jobs:
+  # ── Rust 测试 ──────────────────────────────────────────────────────
+  rust-test:
+    name: Rust Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            shared-core/target
+          key: rust-${{ hashFiles('shared-core/Cargo.lock') }}
+
+      - name: Run tests
+        working-directory: shared-core
+        run: cargo test --verbose
+
+      - name: Check formatting
+        working-directory: shared-core
+        run: cargo fmt --check
+
+      - name: Clippy lint
+        working-directory: shared-core
+        run: cargo clippy -- -D warnings
+
+  # ── Rust 交叉编译到 Android ────────────────────────────────────────
+  rust-android:
+    name: Rust → Android (.so)
+    runs-on: ubuntu-latest
+    needs: rust-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            shared-core/target
+          key: rust-android-${{ hashFiles('shared-core/Cargo.lock') }}
+
+      - name: Build .so (arm64-v8a)
+        working-directory: shared-core
+        run: cargo ndk -t arm64-v8a build --release
+
+      - name: Copy .so to Android project
+        run: |
+          mkdir -p android/app/src/main/jniLibs/arm64-v8a
+          cp shared-core/target/aarch64-linux-android/release/libcamera_shared_core.so \
+             android/app/src/main/jniLibs/arm64-v8a/
+
+      - name: Generate Kotlin bindings
+        working-directory: shared-core
+        run: |
+          cargo run --bin uniffi-bindgen -- generate \
+            --library target/aarch64-linux-android/release/libcamera_shared_core.so \
+            --language kotlin \
+            --out-dir ../android/app/src/main/java/
+
+      - name: Upload .so artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libcamera_shared_core.so
+          path: android/app/src/main/jniLibs/arm64-v8a/libcamera_shared_core.so
+
+      - name: Upload Kotlin bindings
+        uses: actions/upload-artifact@v4
+        with:
+          name: kotlin-bindings
+          path: android/app/src/main/java/uniffi/
+
+  # ── Android 构建 ───────────────────────────────────────────────────
+  android-build:
+    name: Android Build
+    runs-on: ubuntu-latest
+    needs: rust-android
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: temurin
+
+      - name: Download .so artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: libcamera_shared_core.so
+          path: android/app/src/main/jniLibs/arm64-v8a/
+
+      - name: Download Kotlin bindings
+        uses: actions/download-artifact@v4
+        with:
+          name: kotlin-bindings
+          path: android/app/src/main/java/uniffi/
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ hashFiles('android/*.gradle.kts') }}
+
+      - name: Build Debug APK
+        working-directory: android
+        run: ./gradlew assembleDebug --no-daemon
+
+      - name: Build Release APK
+        working-directory: android
+        run: ./gradlew assembleRelease --no-daemon
+
+      - name: Upload Debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: camera-app-debug
+          path: android/app/build/outputs/apk/debug/*.apk
+
+      - name: Upload Release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: camera-app-release
+          path: android/app/build/outputs/apk/release/*.apk
