@@ -26,6 +26,13 @@ import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Cameraswitch
+import androidx.compose.material.icons.filled.FlashAuto
+import androidx.compose.material.icons.filled.FlashOff
+import androidx.compose.material.icons.filled.FlashOn
+import androidx.compose.material.icons.filled.GridOn
+import androidx.compose.material.icons.filled.Brightness6
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -33,6 +40,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
@@ -62,7 +70,6 @@ private val AccentDim = Color(0xFF636366)
 fun CameraScreen() {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    val lifecycleOwner = LocalLifecycleOwner.current
 
     var hasCameraPermission by remember {
         mutableStateOf(
@@ -71,14 +78,13 @@ fun CameraScreen() {
         )
     }
 
-    // 状态
     var capturedBytes by remember { mutableStateOf<ByteArray?>(null) }
     var processedBytes by remember { mutableStateOf<ByteArray?>(null) }
     var selectedFilter by remember { mutableStateOf(FilterType.NONE) }
     var isProcessing by remember { mutableStateOf(false) }
     var isFrontCamera by remember { mutableStateOf(false) }
     var flashMode by remember { mutableIntStateOf(ImageCapture.FLASH_MODE_AUTO) }
-    var selectedMode by remember { mutableIntStateOf(1) } // 0=Video, 1=Photo, 2=Portrait
+    var selectedMode by remember { mutableIntStateOf(1) }
 
     val imageCapture = remember {
         ImageCapture.Builder()
@@ -101,7 +107,6 @@ fun CameraScreen() {
         }
     }
 
-    // 拍照
     fun takePhoto() {
         imageCapture.takePicture(
             captureExecutor,
@@ -123,14 +128,11 @@ fun CameraScreen() {
                     }
                 }
 
-                override fun onError(exception: ImageCaptureException) {
-                    // silent
-                }
+                override fun onError(exception: ImageCaptureException) {}
             }
         )
     }
 
-    // 应用滤镜
     fun applyFilter(filter: FilterType) {
         val bytes = capturedBytes ?: return
         selectedFilter = filter
@@ -148,14 +150,12 @@ fun CameraScreen() {
         }
     }
 
-    // 重拍
     fun retake() {
         capturedBytes = null
         processedBytes = null
         selectedFilter = FilterType.NONE
     }
 
-    // 保存
     fun save() {
         val bytes = processedBytes ?: return
         scope.launch {
@@ -169,7 +169,6 @@ fun CameraScreen() {
         }
     }
 
-    // 切换闪光模式
     fun toggleFlash() {
         flashMode = when (flashMode) {
             ImageCapture.FLASH_MODE_AUTO -> ImageCapture.FLASH_MODE_ON
@@ -179,7 +178,6 @@ fun CameraScreen() {
         imageCapture.flashMode = flashMode
     }
 
-    // 切换前后摄像头
     fun switchCamera() {
         isFrontCamera = !isFrontCamera
     }
@@ -192,7 +190,6 @@ fun CameraScreen() {
             .background(Bg)
     ) {
         if (!hasCameraPermission) {
-            // 无权限
             Column(
                 modifier = Modifier.align(Alignment.Center),
                 horizontalAlignment = Alignment.CenterHorizontally,
@@ -223,7 +220,7 @@ fun CameraScreen() {
         }
 
         if (processedBytes != null) {
-            // ── Review 界面 ──
+            // ── Review ──
             val bitmap = remember(processedBytes) {
                 processedBytes?.let {
                     BitmapFactory.decodeByteArray(it, 0, it.size)
@@ -238,7 +235,6 @@ fun CameraScreen() {
                 )
             }
 
-            // 处理中
             if (isProcessing) {
                 ProcessingBadge(
                     modifier = Modifier
@@ -248,7 +244,6 @@ fun CameraScreen() {
                 )
             }
 
-            // 底部：滤镜 + 操作
             ReviewControls(
                 selectedFilter = selectedFilter,
                 onSelectFilter = { applyFilter(it) },
@@ -261,14 +256,13 @@ fun CameraScreen() {
             )
 
         } else {
-            // ── 取景器 ──
+            // ── Viewfinder ──
             CameraPreviewView(
                 imageCapture = imageCapture,
                 isFrontCamera = isFrontCamera,
                 modifier = Modifier.fillMaxSize()
             )
 
-            // 顶部工具栏
             TopBar(
                 flashMode = flashMode,
                 onFlashToggle = { toggleFlash() },
@@ -278,7 +272,6 @@ fun CameraScreen() {
                     .padding(horizontal = 16.dp, vertical = 8.dp)
             )
 
-            // 底部控制
             ViewfinderControls(
                 selectedMode = selectedMode,
                 onModeChange = { selectedMode = it },
@@ -301,10 +294,10 @@ private fun TopBar(
     onFlashToggle: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    val flashLabel = when (flashMode) {
-        ImageCapture.FLASH_MODE_ON -> "ON"
-        ImageCapture.FLASH_MODE_OFF -> "OFF"
-        else -> "A"
+    val flashIcon = when (flashMode) {
+        ImageCapture.FLASH_MODE_ON -> Icons.Default.FlashOn
+        ImageCapture.FLASH_MODE_OFF -> Icons.Default.FlashOff
+        else -> Icons.Default.FlashAuto
     }
 
     Row(
@@ -312,14 +305,12 @@ private fun TopBar(
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically
     ) {
-        // 闪光
-        CircleTextButton(
-            label = flashLabel,
-            textColor = if (flashMode == ImageCapture.FLASH_MODE_OFF) AccentDim else TextMuted,
+        CircleIconButton(
+            icon = flashIcon,
+            tint = if (flashMode == ImageCapture.FLASH_MODE_OFF) AccentDim else TextMuted,
             onClick = onFlashToggle
         )
 
-        // AUTO 标签
         Text(
             "AUTO",
             color = TextMuted,
@@ -331,8 +322,11 @@ private fun TopBar(
                 .padding(horizontal = 10.dp, vertical = 4.dp)
         )
 
-        // 曝光
-        CircleTextButton(label = "EV", textColor = TextMuted, onClick = { /* TODO */ })
+        CircleIconButton(
+            icon = Icons.Default.Brightness6,
+            tint = TextMuted,
+            onClick = { /* TODO */ }
+        )
     }
 }
 
@@ -352,7 +346,7 @@ private fun ViewfinderControls(
         modifier = modifier.fillMaxWidth(),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        // 模式切换
+        // Mode switch
         Row(
             horizontalArrangement = Arrangement.spacedBy(20.dp),
             verticalAlignment = Alignment.CenterVertically
@@ -374,16 +368,21 @@ private fun ViewfinderControls(
 
         Spacer(modifier = Modifier.height(20.dp))
 
-        // 快门行
+        // Shutter row
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceEvenly,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            // 相册
-            CircleTextButton(label = "G", textColor = TextPrimary, onClick = { /* TODO */ })
+            // Gallery
+            CircleIconButton(
+                icon = Icons.Default.GridOn,
+                tint = TextPrimary,
+                size = 42,
+                onClick = { /* TODO */ }
+            )
 
-            // 快门按钮
+            // Shutter
             Box(
                 modifier = Modifier
                     .size(72.dp)
@@ -401,18 +400,23 @@ private fun ViewfinderControls(
                 )
             }
 
-            // 翻转摄像头
-            CircleTextButton(label = "R", textColor = TextPrimary, onClick = onSwitchCamera)
+            // Switch camera
+            CircleIconButton(
+                icon = Icons.Default.Cameraswitch,
+                tint = TextPrimary,
+                size = 42,
+                onClick = onSwitchCamera
+            )
         }
     }
 }
 
-// ── 通用圆形文字按钮 ────────────────────────────────────────────────
+// ── CircleIconButton ─────────────────────────────────────────────────
 
 @Composable
-private fun CircleTextButton(
-    label: String,
-    textColor: Color,
+private fun CircleIconButton(
+    icon: ImageVector,
+    tint: Color,
     size: Int = 36,
     onClick: () -> Unit
 ) {
@@ -426,11 +430,11 @@ private fun CircleTextButton(
             ) { onClick() },
         contentAlignment = Alignment.Center
     ) {
-        Text(
-            label,
-            color = textColor,
-            fontSize = if (label.length > 1) 11.sp else 13.sp,
-            fontWeight = FontWeight.SemiBold
+        Icon(
+            imageVector = icon,
+            contentDescription = null,
+            tint = tint,
+            modifier = Modifier.size((size * 0.5).dp)
         )
     }
 }
@@ -466,7 +470,6 @@ private fun ReviewControls(
     modifier: Modifier = Modifier
 ) {
     Column(modifier = modifier.fillMaxWidth()) {
-        // 滤镜栏
         LazyRow(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(10.dp),
@@ -501,7 +504,6 @@ private fun ReviewControls(
 
         Spacer(modifier = Modifier.height(12.dp))
 
-        // 操作按钮
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -509,7 +511,6 @@ private fun ReviewControls(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            // 重拍
             TextButton(
                 onClick = onRetake,
                 colors = ButtonDefaults.textButtonColors(contentColor = TextPrimary),
@@ -519,7 +520,6 @@ private fun ReviewControls(
                 Text("Retake", fontSize = 14.sp, fontWeight = FontWeight.Medium)
             }
 
-            // 保存
             Button(
                 onClick = onSave,
                 colors = ButtonDefaults.buttonColors(containerColor = TextPrimary),
@@ -532,7 +532,7 @@ private fun ReviewControls(
     }
 }
 
-// ── ImageProxy → JPEG 转换 ──────────────────────────────────────────
+// ── ImageProxy → JPEG ────────────────────────────────────────────────
 
 private fun imageProxyToJpegBytes(image: ImageProxy): ByteArray {
     if (image.format == ImageFormat.JPEG) {
