@@ -11,7 +11,7 @@ fmt:
 	cargo fmt --all
 
 clippy:
-	cargo clippy --workspace -- -D warnings
+	cargo clippy --workspace
 
 # ── 构建 ─────────────────────────────────────────────────────────────
 

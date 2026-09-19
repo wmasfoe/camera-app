@@ -26,20 +26,18 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            shared-core/target
-          key: rust-${{ hashFiles('shared-core/Cargo.lock') }}
+            target
+          key: rust-${{ hashFiles('Cargo.lock') }}
+          restore-keys: rust-
 
       - name: Run tests
-        working-directory: shared-core
-        run: cargo test --verbose
+        run: cargo test --workspace --verbose
 
       - name: Check formatting
-        working-directory: shared-core
-        run: cargo fmt --check
+        run: cargo fmt --all --check
 
       - name: Clippy lint
-        working-directory: shared-core
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --workspace -- -D warnings
 
   # ── Rust 交叉编译到 Android ────────────────────────────────────────
   rust-android:
@@ -62,26 +60,31 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            shared-core/target
-          key: rust-android-${{ hashFiles('shared-core/Cargo.lock') }}
+            target
+          key: rust-android-${{ hashFiles('Cargo.lock') }}
+          restore-keys: rust-android-
+
+      - name: Cache cargo-ndk
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-ndk
+          key: cargo-ndk-${{ runner.os }}
 
       - name: Build .so (arm64-v8a)
-        working-directory: shared-core
-        run: cargo ndk -t arm64-v8a build --release
+        run: cargo ndk -t arm64-v8a build --release -p camera-shared-core
 
       - name: Copy .so to Android project
         run: |
           mkdir -p android/app/src/main/jniLibs/arm64-v8a
-          cp shared-core/target/aarch64-linux-android/release/libcamera_shared_core.so \
+          cp target/aarch64-linux-android/release/libcamera_shared_core.so \
              android/app/src/main/jniLibs/arm64-v8a/
 
       - name: Generate Kotlin bindings
-        working-directory: shared-core
         run: |
           cargo run --bin uniffi-bindgen -- generate \
             --library target/aarch64-linux-android/release/libcamera_shared_core.so \
             --language kotlin \
-            --out-dir ../android/app/src/main/java/
+            --out-dir android/app/src/main/java/
 
       - name: Upload .so artifact
         uses: actions/upload-artifact@v4
@@ -127,7 +130,8 @@ jobs:
           path: |
             ~/.gradle/caches
             ~/.gradle/wrapper
-          key: gradle-${{ hashFiles('android/*.gradle.kts') }}
+          key: gradle-${{ hashFiles('android/*.gradle.kts', 'android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: gradle-
 
       - name: Build Debug APK
         working-directory: android

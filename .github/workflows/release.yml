@@ -7,9 +7,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  ANDROID_NDK_VERSION: "27.2.12479018"
 
 jobs:
-  # ── Rust 测试 ──────────────────────────────────────────────────────
   rust-test:
     name: Rust Tests
     runs-on: ubuntu-latest
@@ -22,13 +22,12 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            shared-core/target
-          key: rust-${{ hashFiles('shared-core/Cargo.lock') }}
+            target
+          key: rust-${{ hashFiles('Cargo.lock') }}
+          restore-keys: rust-
       - name: Run tests
-        working-directory: shared-core
-        run: cargo test --verbose
+        run: cargo test --workspace --verbose
 
-  # ── Rust → Android .so ─────────────────────────────────────────────
   rust-android:
     name: Rust → Android
     runs-on: ubuntu-latest
@@ -45,23 +44,22 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            shared-core/target
-          key: rust-android-${{ hashFiles('shared-core/Cargo.lock') }}
+            target
+          key: rust-android-${{ hashFiles('Cargo.lock') }}
+          restore-keys: rust-android-
       - name: Build .so
-        working-directory: shared-core
-        run: cargo ndk -t arm64-v8a build --release
+        run: cargo ndk -t arm64-v8a build --release -p camera-shared-core
       - name: Deploy to Android project
         run: |
           mkdir -p android/app/src/main/jniLibs/arm64-v8a
-          cp shared-core/target/aarch64-linux-android/release/libcamera_shared_core.so \
+          cp target/aarch64-linux-android/release/libcamera_shared_core.so \
              android/app/src/main/jniLibs/arm64-v8a/
       - name: Generate Kotlin bindings
-        working-directory: shared-core
         run: |
           cargo run --bin uniffi-bindgen -- generate \
             --library target/aarch64-linux-android/release/libcamera_shared_core.so \
             --language kotlin \
-            --out-dir ../android/app/src/main/java/
+            --out-dir android/app/src/main/java/
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -70,7 +68,6 @@ jobs:
             android/app/src/main/jniLibs/
             android/app/src/main/java/uniffi/
 
-  # ── Android Release + GitHub Release ───────────────────────────────
   release:
     name: Build & Release
     runs-on: ubuntu-latest
@@ -98,7 +95,8 @@ jobs:
           path: |
             ~/.gradle/caches
             ~/.gradle/wrapper
-          key: gradle-${{ hashFiles('android/*.gradle.kts') }}
+          key: gradle-${{ hashFiles('android/*.gradle.kts', 'android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: gradle-
 
       - name: Build Release APK
         working-directory: android

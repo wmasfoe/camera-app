@@ -17,7 +17,6 @@ android {
     }
 
     signingConfigs {
-        // Alpha 版本使用 debug 签名
         create("alpha") {
             storeFile = file("debug.keystore")
             storePassword = "android"
@@ -28,7 +27,6 @@ android {
 
     buildTypes {
         release {
-            // Alpha 版本不做混淆，方便调试
             isMinifyEnabled = false
             isDebuggable = false
             signingConfig = signingConfigs.getByName("alpha")
@@ -43,7 +41,6 @@ android {
         compose = true
     }
 
-    // 加载 Rust 编译的 .so
     sourceSets {
         getByName("main") {
             jniLibs.srcDirs("src/main/jniLibs")
@@ -68,7 +65,6 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
     implementation("androidx.activity:activity-compose:1.9.3")
-    implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
     debugImplementation("androidx.compose.ui:ui-tooling")
 
     // CameraX
@@ -76,7 +72,7 @@ dependencies {
     implementation("androidx.camera:camera-camera2:$cameraxVersion")
     implementation("androidx.camera:camera-lifecycle:$cameraxVersion")
     implementation("androidx.camera:camera-view:$cameraxVersion")
-    implementation("androidx.camera:camera-extensions:$cameraxVersion")
+    implementation("androidx.camera:camera-video:$cameraxVersion")
 
     // Coroutines
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")

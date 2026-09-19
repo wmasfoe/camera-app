@@ -1,7 +1,7 @@
 use std::io::Cursor;
 
 use image::codecs::jpeg::JpegEncoder;
-use image::{ImageBuffer, Rgb, RgbImage};
+use image::RgbImage;
 
 use crate::error::CameraError;
 use crate::types::FilterType;
@@ -9,6 +9,7 @@ use crate::types::FilterType;
 const JPEG_QUALITY: u8 = 85;
 
 /// 图像处理器 — 所有滤镜算法在 Rust 层实现
+#[derive(Default)]
 pub struct ImageProcessor;
 
 impl ImageProcessor {
@@ -104,7 +105,7 @@ impl ImageProcessor {
 // ── Decode / Encode ──────────────────────────────────────────────────
 
 fn decode_rgb(jpeg_bytes: &[u8]) -> Result<RgbImage, CameraError> {
-    let dynamic = image::load_from_memory(jpeg_bytes).map_err(|e| CameraError::ProcessingFailed)?;
+    let dynamic = image::load_from_memory(jpeg_bytes).map_err(|_| CameraError::ProcessingFailed)?;
     Ok(dynamic.to_rgb8())
 }
 
@@ -141,11 +142,12 @@ fn apply_noir(pixels: &mut [u8]) {
     let y_range = y_max - y_min;
 
     let mut lut = [0u8; 256];
-    for i in 0..256 {
+    for (i, item) in lut.iter_mut().enumerate() {
         let x = i as f32 / 255.0;
         let y = 1.0 / (1.0 + (-K * (x - 0.5)).exp());
         let normalized = (y - y_min) / y_range;
-        lut[i] = (normalized * 255.0).clamp(0.0, 255.0) as u8;
+        let val = (normalized * 255.0).clamp(0.0, 255.0) as u8;
+        *item = val;
     }
 
     for_each_pixel(pixels, |px| {
@@ -235,8 +237,8 @@ fn apply_vivid_with_factor(pixels: &mut [u8], saturation: f32) {
 fn apply_fade(pixels: &mut [u8]) {
     // Step 1: 范围压缩 [0,255] → [30, 230]
     let mut lut_compress = [0u8; 256];
-    for i in 0..256 {
-        lut_compress[i] = (i as f32 * (200.0 / 255.0) + 30.0).clamp(0.0, 255.0) as u8;
+    for (i, item) in lut_compress.iter_mut().enumerate() {
+        *item = (i as f32 * (200.0 / 255.0) + 30.0).clamp(0.0, 255.0) as u8;
     }
 
     // Step 2: 15% 去饱和 (定点数)
@@ -278,8 +280,8 @@ fn apply_auto_contrast(pixels: &mut [u8]) {
 
     // 构建 LUT
     let mut lut = [0u8; 256];
-    for i in 0..256 {
-        lut[i] = (((i as f32 - min_lum as f32) * scale).clamp(0.0, 255.0)) as u8;
+    for (i, item) in lut.iter_mut().enumerate() {
+        *item = (((i as f32 - min_lum as f32) * scale).clamp(0.0, 255.0)) as u8;
     }
 
     for_each_pixel(pixels, |px| {

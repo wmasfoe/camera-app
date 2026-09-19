@@ -824,9 +824,21 @@ private fun imageProxyToJpegBytes(image: ImageProxy): ByteArray {
     val jpegBytes = if (image.format == ImageFormat.JPEG) {
         val buf = image.planes[0].buffer; ByteArray(buf.remaining()).also { buf.get(it) }
     } else {
-        val y = image.planes[0].buffer; val u = image.planes[1].buffer; val v = image.planes[2].buffer
-        val nv21 = ByteArray(y.remaining() + u.remaining() + v.remaining())
-        y.get(nv21, 0, y.remaining()); v.get(nv21, y.remaining(), v.remaining()); u.get(nv21, y.remaining() + v.remaining(), u.remaining())
+        // YUV → NV21 (YCbCr semi-planar: YYYY...VUVU)
+        val y = image.planes[0].buffer
+        val u = image.planes[1].buffer
+        val v = image.planes[2].buffer
+        val ySize = y.remaining()
+        val uvSize = u.remaining().coerceAtMost(v.remaining())
+        val nv21 = ByteArray(ySize + uvSize * 2)
+        // Y plane
+        y.get(nv21, 0, ySize)
+        // Interleave V,U into NV21 format (VUVU...)
+        val uvOffset = ySize
+        for (i in 0 until uvSize) {
+            nv21[uvOffset + i * 2] = v.get(i)
+            nv21[uvOffset + i * 2 + 1] = u.get(i)
+        }
         val out = ByteArrayOutputStream()
         YuvImage(nv21, ImageFormat.NV21, image.width, image.height, null).compressToJpeg(Rect(0, 0, image.width, image.height), 95, out)
         out.toByteArray()
