@@ -230,12 +230,15 @@ fun CameraScreen() {
         }
     }
 
-    // 检测 RAW 支持
+    // 检测 RAW 支持 (通过 Camera2 API)
     LaunchedEffect(camera) {
         camera?.cameraInfo?.let { info ->
-            // CameraX 1.4+ 通过 supportedOutputFormats 检测
             isRawSupported = try {
-                info.supportedOutputFormats.contains(ImageFormat.RAW_SENSOR)
+                val cameraId = info.cameraId
+                val manager = context.getSystemService(Context.CAMERA_SERVICE) as android.hardware.camera2.CameraManager
+                val chars = manager.getCameraCharacteristics(cameraId)
+                val capabilities = chars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
+                capabilities?.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_RAW) == true
             } catch (_: Exception) {
                 false
             }
