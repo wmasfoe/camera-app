@@ -117,3 +117,141 @@ pub struct ProcessedInfo {
     pub filter_applied: String,
     pub processing_time_ms: f32,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_camera_config_default() {
+        let config = CameraConfig::default();
+        assert_eq!(config.width, 1920);
+        assert_eq!(config.height, 1080);
+        assert_eq!(config.fps, 30);
+        assert_eq!(config.flash, FlashMode::Auto);
+        assert_eq!(config.facing, CameraFacing::Back);
+        assert_eq!(config.mode, CaptureMode::Photo);
+        assert!(!config.enable_hdr);
+        assert!((config.zoom - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_camera_config_custom() {
+        let config = CameraConfig {
+            width: 3840,
+            height: 2160,
+            fps: 60,
+            flash: FlashMode::On,
+            facing: CameraFacing::Front,
+            mode: CaptureMode::Video,
+            enable_hdr: true,
+            zoom: 2.5,
+        };
+        assert_eq!(config.width, 3840);
+        assert_eq!(config.fps, 60);
+        assert_eq!(config.flash, FlashMode::On);
+        assert_eq!(config.facing, CameraFacing::Front);
+        assert!(config.enable_hdr);
+    }
+
+    #[test]
+    fn test_app_settings_default() {
+        let settings = AppSettings::default();
+        assert_eq!(settings.jpeg_quality, 95);
+        assert_eq!(settings.photo_format, "jpeg");
+        assert!(settings.save_location);
+        assert!(!settings.mirror_front_camera);
+        assert_eq!(settings.default_filter, FilterType::None);
+        assert!(settings.shutter_sound);
+        assert!(settings.grid_lines);
+        assert!(!settings.location_tag);
+    }
+
+    #[test]
+    fn test_app_settings_serde_roundtrip() {
+        let settings = AppSettings::default();
+        let json = serde_json::to_string(&settings).unwrap();
+        let loaded: AppSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(settings, loaded);
+    }
+
+    #[test]
+    fn test_app_settings_serde_custom() {
+        let mut settings = AppSettings::default();
+        settings.jpeg_quality = 80;
+        settings.grid_lines = false;
+        settings.default_filter = FilterType::Noir;
+
+        let json = serde_json::to_string(&settings).unwrap();
+        let loaded: AppSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.jpeg_quality, 80);
+        assert!(!loaded.grid_lines);
+        assert_eq!(loaded.default_filter, FilterType::Noir);
+    }
+
+    #[test]
+    fn test_filter_type_serde() {
+        let filters = vec![
+            FilterType::None,
+            FilterType::Vivid,
+            FilterType::Warm,
+            FilterType::Cool,
+            FilterType::Noir,
+            FilterType::Fade,
+        ];
+        for filter in filters {
+            let json = serde_json::to_string(&filter).unwrap();
+            let loaded: FilterType = serde_json::from_str(&json).unwrap();
+            assert_eq!(filter, loaded);
+        }
+    }
+
+    #[test]
+    fn test_flash_mode_variants() {
+        assert_ne!(FlashMode::Off, FlashMode::On);
+        assert_ne!(FlashMode::Auto, FlashMode::Torch);
+        assert_eq!(FlashMode::Auto, FlashMode::Auto);
+    }
+
+    #[test]
+    fn test_camera_facing_variants() {
+        assert_ne!(CameraFacing::Back, CameraFacing::Front);
+    }
+
+    #[test]
+    fn test_capture_mode_variants() {
+        assert_ne!(CaptureMode::Photo, CaptureMode::Video);
+        assert_ne!(CaptureMode::Portrait, CaptureMode::Night);
+    }
+
+    #[test]
+    fn test_capture_result_fields() {
+        let result = CaptureResult {
+            file_path: "/test/photo.jpg".to_string(),
+            width: 4000,
+            height: 3000,
+            file_size: 2_500_000,
+            timestamp: 1700000000000,
+            is_front_camera: false,
+            flash_used: FlashMode::Auto,
+            zoom_used: 1.0,
+        };
+        assert_eq!(result.file_path, "/test/photo.jpg");
+        assert_eq!(result.width, 4000);
+        assert!(!result.is_front_camera);
+    }
+
+    #[test]
+    fn test_processed_info_fields() {
+        let info = ProcessedInfo {
+            file_path: "/test/processed.jpg".to_string(),
+            width: 4000,
+            height: 3000,
+            file_size: 1_800_000,
+            filter_applied: "Noir".to_string(),
+            processing_time_ms: 45.5,
+        };
+        assert_eq!(info.filter_applied, "Noir");
+        assert!(info.processing_time_ms > 0.0);
+    }
+}

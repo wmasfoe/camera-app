@@ -404,4 +404,148 @@ mod tests {
             assert!(!name.is_empty());
         }
     }
+
+    #[test]
+    fn test_compress_invalid_quality_zero() {
+        let processor = ImageProcessor::new();
+        let input = make_2x2_color_jpeg();
+        assert!(processor.compress(input, 0).is_err());
+    }
+
+    #[test]
+    fn test_compress_invalid_quality_over_100() {
+        let processor = ImageProcessor::new();
+        let input = make_2x2_color_jpeg();
+        assert!(processor.compress(input, 101).is_err());
+    }
+
+    #[test]
+    fn test_compress_boundary_quality_1() {
+        let processor = ImageProcessor::new();
+        let input = make_2x2_color_jpeg();
+        let result = processor.compress(input, 1);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_compress_boundary_quality_100() {
+        let processor = ImageProcessor::new();
+        let input = make_2x2_color_jpeg();
+        let result = processor.compress(input, 100);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_filter_output_is_valid_jpeg() {
+        let processor = ImageProcessor::new();
+        let input = make_2x2_color_jpeg();
+        for filter in processor.supported_filters() {
+            let output = processor.apply_filter(input.clone(), filter).unwrap();
+            let decoded = image::load_from_memory(&output);
+            assert!(decoded.is_ok(), "Filter {:?} produced invalid JPEG", filter);
+        }
+    }
+
+    #[test]
+    fn test_auto_enhance_preserves_dimensions() {
+        let processor = ImageProcessor::new();
+        let input = make_2x2_color_jpeg();
+        let original = image::load_from_memory(&input).unwrap().to_rgb8();
+        let enhanced = processor.auto_enhance(input).unwrap();
+        let result = image::load_from_memory(&enhanced).unwrap().to_rgb8();
+        assert_eq!(original.dimensions(), result.dimensions());
+    }
+
+    #[test]
+    fn test_noir_white_stays_white() {
+        // 白色经过 noir 应该还是接近白色
+        let img = RgbImage::from_pixel(1, 1, Rgb([255u8, 255, 255]));
+        let input = encode_jpeg(&img, 95).unwrap();
+        let processor = ImageProcessor::new();
+        let output = processor.apply_filter(input, FilterType::Noir).unwrap();
+        let decoded = image::load_from_memory(&output).unwrap().to_rgb8();
+        let px = decoded.get_pixel(0, 0);
+        // 白色经过 sigmoid 应该还是接近 255
+        assert!(
+            px[0] > 200,
+            "White should stay bright after noir, got {}",
+            px[0]
+        );
+    }
+
+    #[test]
+    fn test_noir_black_stays_black() {
+        // 黑色经过 noir 应该还是接近黑色
+        let img = RgbImage::from_pixel(1, 1, Rgb([0u8, 0, 0]));
+        let input = encode_jpeg(&img, 95).unwrap();
+        let processor = ImageProcessor::new();
+        let output = processor.apply_filter(input, FilterType::Noir).unwrap();
+        let decoded = image::load_from_memory(&output).unwrap().to_rgb8();
+        let px = decoded.get_pixel(0, 0);
+        assert!(
+            px[0] < 50,
+            "Black should stay dark after noir, got {}",
+            px[0]
+        );
+    }
+
+    #[test]
+    fn test_fade_white_compresses() {
+        // Fade 应该把纯白和纯黑都压缩到中间范围
+        let img = RgbImage::from_pixel(1, 1, Rgb([255u8, 255, 255]));
+        let input = encode_jpeg(&img, 95).unwrap();
+        let processor = ImageProcessor::new();
+        let output = processor.apply_filter(input, FilterType::Fade).unwrap();
+        let decoded = image::load_from_memory(&output).unwrap().to_rgb8();
+        let px = decoded.get_pixel(0, 0);
+        // 纯白经过 fade 应该被压缩到 ~230 范围
+        assert!(
+            px[0] < 240,
+            "White should be compressed by fade, got {}",
+            px[0]
+        );
+        assert!(
+            px[0] > 200,
+            "White should still be bright after fade, got {}",
+            px[0]
+        );
+    }
+
+    #[test]
+    fn test_warm_preserves_brightness() {
+        // Warm 滤镜不应该大幅改变整体亮度
+        let img = RgbImage::from_pixel(1, 1, Rgb([128u8, 128, 128]));
+        let input = encode_jpeg(&img, 95).unwrap();
+        let processor = ImageProcessor::new();
+        let output = processor.apply_filter(input, FilterType::Warm).unwrap();
+        let decoded = image::load_from_memory(&output).unwrap().to_rgb8();
+        let px = decoded.get_pixel(0, 0);
+        // 灰色经过 warm 后亮度应该大致保持
+        let brightness = (px[0] as i32 + px[1] as i32 + px[2] as i32) / 3;
+        assert!(
+            brightness > 100 && brightness < 180,
+            "Brightness should be ~128, got {}",
+            brightness
+        );
+    }
+
+    #[test]
+    fn test_vivid_neutral_gray_unchanged() {
+        // 灰色 (R=G=B) 经过 vivid 饱和度提升应该不变
+        let img = RgbImage::from_pixel(1, 1, Rgb([128u8, 128, 128]));
+        let input = encode_jpeg(&img, 95).unwrap();
+        let processor = ImageProcessor::new();
+        let output = processor.apply_filter(input, FilterType::Vivid).unwrap();
+        let decoded = image::load_from_memory(&output).unwrap().to_rgb8();
+        let px = decoded.get_pixel(0, 0);
+        // 灰色没有饱和度可提升，应该大致不变
+        assert!((px[0] as i32 - px[1] as i32).abs() < 10);
+        assert!((px[1] as i32 - px[2] as i32).abs() < 10);
+    }
+
+    #[test]
+    fn test_supported_filters_count() {
+        let processor = ImageProcessor::new();
+        assert_eq!(processor.supported_filters().len(), 6);
+    }
 }

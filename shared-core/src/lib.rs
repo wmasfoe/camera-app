@@ -2,8 +2,6 @@
 // Rust 共享核心库 — 编译到 Android (.so) 和 iOS (.a)
 // 通过 UniFFI 自动生成 Kotlin 和 Swift 绑定
 
-#![allow(empty_line_after_doc_comment)]
-
 mod error;
 mod image_processor;
 mod settings;
