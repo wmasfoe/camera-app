@@ -83,4 +83,10 @@ dependencies {
 
     // JNA — UniFFI 生成的 Kotlin 绑定需要
     implementation("net.java.dev.jna:jna:5.17.0@aar")
+
+    // GPS 定位
+    implementation("com.google.android.gms:play-services-location:21.3.0")
+
+    // EXIF 写入 (GPS 坐标)
+    implementation("androidx.exifinterface:exifinterface:1.3.7")
 }

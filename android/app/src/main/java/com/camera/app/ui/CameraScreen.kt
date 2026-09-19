@@ -11,6 +11,9 @@ import android.graphics.ImageFormat
 import android.graphics.Matrix
 import android.graphics.Rect
 import android.graphics.YuvImage
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraMetadata
+import android.location.Location
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.provider.MediaStore
@@ -20,12 +23,15 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.AspectRatio
 import androidx.camera.core.Camera
+import androidx.camera.core.CameraInfo
 import androidx.camera.core.CameraSelector
+import androidx.camera.core.DynamicRange
 import androidx.camera.core.FocusMeteringAction
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
+import androidx.camera.core.UseCaseGroup
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.video.FileOutputOptions
 import androidx.camera.video.Recorder
@@ -54,6 +60,8 @@ import androidx.compose.material.icons.filled.FlashAuto
 import androidx.compose.material.icons.filled.FlashOff
 import androidx.compose.material.icons.filled.FlashOn
 import androidx.compose.material.icons.filled.GridOn
+import androidx.compose.material.icons.filled.LocationOn
+import androidx.compose.material.icons.filled.PhotoCamera
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -73,10 +81,15 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import androidx.exifinterface.media.ExifInterface
 import com.camera.app.bridge.PhotoSaver
 import com.camera.app.bridge.RustBridge
+import com.google.android.gms.location.LocationServices
+import com.google.android.gms.location.Priority
+import com.google.android.gms.tasks.CancellationTokenSource
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 import uniffi.camera_shared_core.FilterType
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -85,6 +98,7 @@ import java.util.Date
 import java.util.Locale
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import kotlin.coroutines.resume
 
 // ── Tokens ───────────────────────────────────────────────────────────
 
@@ -110,9 +124,15 @@ fun CameraScreen() {
     var hasAudioPermission by remember {
         mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED)
     }
+    var hasLocationPermission by remember {
+        mutableStateOf(
+            ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        )
+    }
 
     // Photo state
     var capturedBytes by remember { mutableStateOf<ByteArray?>(null) }
+    var capturedRawBytes by remember { mutableStateOf<ByteArray?>(null) }
     var processedBytes by remember { mutableStateOf<ByteArray?>(null) }
     var selectedFilter by remember { mutableStateOf(FilterType.NONE) }
     var isProcessing by remember { mutableStateOf(false) }
@@ -123,8 +143,16 @@ fun CameraScreen() {
     var selectedMode by remember { mutableIntStateOf(1) } // 0=Video, 1=Photo, 2=Portrait
     var zoomRatio by remember { mutableFloatStateOf(1f) }
     var showGrid by remember { mutableStateOf(false) }
-    var exposureComp by remember { mutableFloatStateOf(0f) } // -1.0 to 1.0
+    var exposureComp by remember { mutableFloatStateOf(0f) }
     var showExposureSlider by remember { mutableStateOf(false) }
+
+    // GPS
+    var enableLocation by remember { mutableStateOf(false) }
+    var currentLocation by remember { mutableStateOf<Location?>(null) }
+
+    // RAW
+    var enableRaw by remember { mutableStateOf(false) }
+    var isRawSupported by remember { mutableStateOf(false) }
 
     // Focus
     var focusPoint by remember { mutableStateOf<Offset?>(null) }
@@ -165,19 +193,53 @@ fun CameraScreen() {
 
     val captureExecutor = remember { Executors.newSingleThreadExecutor() }
     val vibrator = remember { context.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator }
+    val fusedLocationClient = remember { LocationServices.getFusedLocationProviderClient(context) }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { results ->
         hasCameraPermission = results[Manifest.permission.CAMERA] == true
         hasAudioPermission = results[Manifest.permission.RECORD_AUDIO] == true
+        hasLocationPermission = results[Manifest.permission.ACCESS_FINE_LOCATION] == true
+        if (hasLocationPermission) enableLocation = true
     }
 
     LaunchedEffect(Unit) {
-        if (!hasCameraPermission || !hasAudioPermission) {
-            permissionLauncher.launch(arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO))
-        }
+        val needed = mutableListOf<String>()
+        if (!hasCameraPermission) needed.add(Manifest.permission.CAMERA)
+        if (!hasAudioPermission) needed.add(Manifest.permission.RECORD_AUDIO)
+        if (needed.isNotEmpty()) permissionLauncher.launch(needed.toTypedArray())
         lastPhotoBitmap = loadLastPhotoThumbnail(context)
+    }
+
+    // 获取当前位置
+    LaunchedEffect(enableLocation, hasLocationPermission) {
+        if (enableLocation && hasLocationPermission) {
+            try {
+                val cts = CancellationTokenSource()
+                currentLocation = suspendCancellableCoroutine { cont ->
+                    fusedLocationClient.getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, cts.token)
+                        .addOnSuccessListener { loc -> cont.resume(loc) }
+                        .addOnFailureListener { cont.resume(null) }
+                }
+            } catch (_: SecurityException) {
+                currentLocation = null
+            }
+        } else {
+            currentLocation = null
+        }
+    }
+
+    // 检测 RAW 支持
+    LaunchedEffect(camera) {
+        camera?.cameraInfo?.let { info ->
+            // CameraX 1.4+ 通过 supportedOutputFormats 检测
+            isRawSupported = try {
+                info.supportedOutputFormats.contains(ImageFormat.RAW_SENSOR)
+            } catch (_: Exception) {
+                false
+            }
+        }
     }
 
     // Focus ring disappear
@@ -194,10 +256,7 @@ fun CameraScreen() {
     LaunchedEffect(isRecording) {
         if (isRecording) {
             recordingDuration = 0
-            while (isRecording) {
-                delay(1000)
-                recordingDuration++
-            }
+            while (isRecording) { delay(1000); recordingDuration++ }
         }
     }
 
@@ -207,13 +266,33 @@ fun CameraScreen() {
         showFlash = true
         vibrator?.vibrate(VibrationEffect.createOneShot(30, VibrationEffect.DEFAULT_AMPLITUDE))
 
+        // 刷新位置
+        if (enableLocation && hasLocationPermission) {
+            try {
+                val cts = CancellationTokenSource()
+                fusedLocationClient.getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, cts.token)
+                    .addOnSuccessListener { loc -> currentLocation = loc }
+            } catch (_: SecurityException) {}
+        }
+
         imageCapture.takePicture(captureExecutor, object : ImageCapture.OnImageCapturedCallback() {
             override fun onCaptureSuccess(image: ImageProxy) {
                 val jpegBytes = imageProxyToJpegBytes(image)
+
+                // RAW 捕获
+                val rawBytes: ByteArray? = if (enableRaw && image.format == ImageFormat.RAW_SENSOR) {
+                    try {
+                        val buf = image.planes[0].buffer
+                        ByteArray(buf.remaining()).also { buf.get(it) }
+                    } catch (_: Exception) { null }
+                } else null
+
                 image.close()
+
                 scope.launch {
                     isProcessing = true
                     capturedBytes = jpegBytes
+                    capturedRawBytes = rawBytes
                     processedBytes = jpegBytes
                     RustBridge.autoEnhance(jpegBytes).onSuccess { processedBytes = it }
                     isProcessing = false
@@ -240,38 +319,28 @@ fun CameraScreen() {
                     if (event.hasError()) {
                         scope.launch { Toast.makeText(ctx, "Recording failed", Toast.LENGTH_SHORT).show() }
                     } else {
-                        // Save to gallery
                         scope.launch {
                             val uri = PhotoSaver.saveVideoToGallery(ctx, videoFile)
-                            if (uri != null) {
-                                Toast.makeText(ctx, "Video saved", Toast.LENGTH_SHORT).show()
-                            }
+                            if (uri != null) Toast.makeText(ctx, "Video saved", Toast.LENGTH_SHORT).show()
                             lastPhotoBitmap = loadLastPhotoThumbnail(ctx)
                         }
                     }
                 }
             }
-
         isRecording = true
     }
 
     fun stopRecording() {
-        activeRecording?.stop()
-        activeRecording = null
-        isRecording = false
+        activeRecording?.stop(); activeRecording = null; isRecording = false
     }
 
     fun onTapToFocus(x: Float, y: Float) {
-        focusPoint = Offset(x, y)
-        showFocusRing = true
-
+        focusPoint = Offset(x, y); showFocusRing = true
         val pv = previewViewRef ?: return
         val ctrl = camera?.cameraControl ?: return
-
         val point = pv.meteringPointFactory.createPoint(x, y)
         val action = FocusMeteringAction.Builder(point, FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE)
-            .setAutoCancelDuration(3, TimeUnit.SECONDS)
-            .build()
+            .setAutoCancelDuration(3, TimeUnit.SECONDS).build()
         ctrl.startFocusAndMetering(action)
     }
 
@@ -303,15 +372,26 @@ fun CameraScreen() {
     }
 
     fun retake() {
-        capturedBytes = null; processedBytes = null; selectedFilter = FilterType.NONE
+        capturedBytes = null; capturedRawBytes = null; processedBytes = null; selectedFilter = FilterType.NONE
     }
 
     fun save() {
         val bytes = processedBytes ?: return
         scope.launch {
-            val uri = PhotoSaver.saveJpegToGallery(context, bytes)
-            if (uri != null) { Toast.makeText(context, "Saved", Toast.LENGTH_SHORT).show(); retake() }
-            else Toast.makeText(context, "Failed", Toast.LENGTH_SHORT).show()
+            // 保存 JPEG（带 GPS）
+            val uri = PhotoSaver.saveJpegToGallery(context, bytes, location = currentLocation)
+            if (uri == null) {
+                Toast.makeText(context, "Failed", Toast.LENGTH_SHORT).show()
+                return@launch
+            }
+
+            // 保存 RAW（如果有）
+            capturedRawBytes?.let { raw ->
+                PhotoSaver.saveDngToGallery(context, raw)
+            }
+
+            Toast.makeText(context, "Saved", Toast.LENGTH_SHORT).show()
+            retake()
         }
     }
 
@@ -329,10 +409,19 @@ fun CameraScreen() {
     }
 
     fun openGallery() {
-        val intent = Intent(Intent.ACTION_VIEW, MediaStore.Images.Media.EXTERNAL_CONTENT_URI)
-        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        try { context.startActivity(intent) } catch (_: Exception) {
+        try {
+            context.startActivity(Intent(Intent.ACTION_VIEW, MediaStore.Images.Media.EXTERNAL_CONTENT_URI)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        } catch (_: Exception) {
             Toast.makeText(context, "No gallery app found", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    fun toggleLocation() {
+        if (!hasLocationPermission) {
+            permissionLauncher.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION))
+        } else {
+            enableLocation = !enableLocation
         }
     }
 
@@ -356,6 +445,7 @@ fun CameraScreen() {
                 selectedMode, lastPhotoBitmap,
                 isRecording, recordingDuration,
                 showExposureSlider, exposureComp,
+                enableLocation, enableRaw, isRawSupported,
                 onCameraReady = { c, pv -> camera = c; previewViewRef = pv },
                 onTap = { x, y -> onTapToFocus(x, y) },
                 onZoom = { onZoom(it) },
@@ -367,14 +457,13 @@ fun CameraScreen() {
                 },
                 onFlashToggle = { toggleFlash() },
                 onSwitchCamera = { switchCamera() },
-                onModeChange = {
-                    if (isRecording) stopRecording()
-                    selectedMode = it
-                },
+                onModeChange = { if (isRecording) stopRecording(); selectedMode = it },
                 onGridToggle = { showGrid = !showGrid },
                 onGalleryClick = { openGallery() },
                 onExposureToggle = { showExposureSlider = !showExposureSlider },
-                onExposureChange = { setExposure(it) }
+                onExposureChange = { setExposure(it) },
+                onLocationToggle = { toggleLocation() },
+                onRawToggle = { enableRaw = !enableRaw }
             )
         }
     }
@@ -415,6 +504,9 @@ private fun ViewfinderScreen(
     recordingDuration: Int,
     showExposureSlider: Boolean,
     exposureComp: Float,
+    enableLocation: Boolean,
+    enableRaw: Boolean,
+    isRawSupported: Boolean,
     onCameraReady: (Camera, PreviewView) -> Unit,
     onTap: (Float, Float) -> Unit,
     onZoom: (Float) -> Unit,
@@ -425,10 +517,11 @@ private fun ViewfinderScreen(
     onGridToggle: () -> Unit,
     onGalleryClick: () -> Unit,
     onExposureToggle: () -> Unit,
-    onExposureChange: (Float) -> Unit
+    onExposureChange: (Float) -> Unit,
+    onLocationToggle: () -> Unit,
+    onRawToggle: () -> Unit
 ) {
     Box(Modifier.fillMaxSize()) {
-        // Preview
         Box(Modifier.fillMaxSize().pointerInput(Unit) {
             detectTransformGestures { _, _, zoom, _ -> if (zoom != 1f) onZoom(zoom) }
         }) {
@@ -437,11 +530,11 @@ private fun ViewfinderScreen(
                 Modifier.fillMaxWidth().aspectRatio(3f / 4f).align(Alignment.Center))
         }
 
-        // Shutter flash
         if (showFlash) Box(Modifier.fillMaxSize().background(Color.White.copy(alpha = 0.7f)))
 
         // Top bar
-        TopBar(flashMode, showGrid, onFlashToggle, onGridToggle, onExposureToggle,
+        TopBar(flashMode, showGrid, enableLocation, enableRaw, isRawSupported,
+            onFlashToggle, onGridToggle, onExposureToggle, onLocationToggle, onRawToggle,
             Modifier.align(Alignment.TopStart).statusBarsPadding().padding(horizontal = 16.dp, vertical = 8.dp))
 
         // Zoom indicator
@@ -453,7 +546,7 @@ private fun ViewfinderScreen(
                     .padding(horizontal = 10.dp, vertical = 4.dp))
         }
 
-        // Exposure slider (vertical, right side)
+        // Exposure slider
         if (showExposureSlider) {
             ExposureSlider(exposureComp, onExposureChange,
                 Modifier.align(Alignment.CenterEnd).padding(end = 16.dp))
@@ -463,6 +556,28 @@ private fun ViewfinderScreen(
         if (isRecording) {
             RecordingIndicator(recordingDuration,
                 Modifier.align(Alignment.TopCenter).statusBarsPadding().padding(top = 12.dp))
+        }
+
+        // GPS indicator
+        if (enableLocation) {
+            Row(Modifier.align(Alignment.TopEnd).statusBarsPadding().padding(top = 56.dp, end = 16.dp)
+                .background(Surface2.copy(alpha = 0.6f), RoundedCornerShape(10.dp))
+                .padding(horizontal = 8.dp, vertical = 3.dp),
+                verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                Icon(Icons.Default.LocationOn, null, tint = TextMuted, modifier = Modifier.size(12.dp))
+                Text("GPS", color = TextMuted, fontSize = 10.sp, fontWeight = FontWeight.Medium)
+            }
+        }
+
+        // RAW indicator
+        if (enableRaw) {
+            Row(Modifier.align(Alignment.TopEnd).statusBarsPadding().padding(top = if (enableLocation) 80.dp else 56.dp, end = 16.dp)
+                .background(Surface2.copy(alpha = 0.6f), RoundedCornerShape(10.dp))
+                .padding(horizontal = 8.dp, vertical = 3.dp),
+                verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                Icon(Icons.Default.PhotoCamera, null, tint = TextMuted, modifier = Modifier.size(12.dp))
+                Text("RAW", color = TextMuted, fontSize = 10.sp, fontWeight = FontWeight.Medium)
+            }
         }
 
         // Bottom controls
@@ -510,7 +625,13 @@ private fun CameraPreviewWithFocus(
                     val selector = if (isFrontCamera) CameraSelector.DEFAULT_FRONT_CAMERA else CameraSelector.DEFAULT_BACK_CAMERA
                     try {
                         provider.unbindAll()
-                        val cam = provider.bindToLifecycle(lifecycleOwner, selector, preview, imageCapture, videoCapture)
+                        val useCaseGroup = UseCaseGroup.Builder()
+                            .addUseCase(preview)
+                            .addUseCase(imageCapture)
+                            .addUseCase(videoCapture)
+                            .setViewPort(pv.viewPort!!)
+                            .build()
+                        val cam = provider.bindToLifecycle(lifecycleOwner, selector, useCaseGroup)
                         onCameraReady(cam, pv)
                     } catch (_: Exception) {}
                 }, ContextCompat.getMainExecutor(context))
@@ -553,17 +674,8 @@ private fun ExposureSlider(value: Float, onChange: (Float) -> Unit, modifier: Mo
     Column(modifier.width(36.dp), horizontalAlignment = Alignment.CenterHorizontally) {
         Icon(Icons.Default.Brightness6, null, tint = TextPrimary, modifier = Modifier.size(16.dp))
         Spacer(Modifier.height(8.dp))
-        Slider(
-            value = value,
-            onValueChange = onChange,
-            valueRange = -1f..1f,
-            modifier = Modifier.height(200.dp),
-            colors = SliderDefaults.colors(
-                thumbColor = TextPrimary,
-                activeTrackColor = TextPrimary,
-                inactiveTrackColor = AccentDim
-            )
-        )
+        Slider(value = value, onValueChange = onChange, valueRange = -1f..1f, modifier = Modifier.height(200.dp),
+            colors = SliderDefaults.colors(thumbColor = TextPrimary, activeTrackColor = TextPrimary, inactiveTrackColor = AccentDim))
     }
 }
 
@@ -571,8 +683,7 @@ private fun ExposureSlider(value: Float, onChange: (Float) -> Unit, modifier: Mo
 
 @Composable
 private fun RecordingIndicator(duration: Int, modifier: Modifier) {
-    val min = duration / 60
-    val sec = duration % 60
+    val min = duration / 60; val sec = duration % 60
     Row(modifier.background(Surface.copy(alpha = 0.8f), RoundedCornerShape(14.dp)).padding(horizontal = 12.dp, vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         Box(Modifier.size(8.dp).background(Danger, CircleShape))
@@ -583,18 +694,34 @@ private fun RecordingIndicator(duration: Int, modifier: Modifier) {
 // ── TopBar ───────────────────────────────────────────────────────────
 
 @Composable
-private fun TopBar(flashMode: Int, showGrid: Boolean,
-    onFlashToggle: () -> Unit, onGridToggle: () -> Unit, onExposureToggle: () -> Unit, modifier: Modifier) {
+private fun TopBar(
+    flashMode: Int, showGrid: Boolean, enableLocation: Boolean, enableRaw: Boolean, isRawSupported: Boolean,
+    onFlashToggle: () -> Unit, onGridToggle: () -> Unit, onExposureToggle: () -> Unit,
+    onLocationToggle: () -> Unit, onRawToggle: () -> Unit, modifier: Modifier
+) {
     val flashIcon = when (flashMode) {
         ImageCapture.FLASH_MODE_ON -> Icons.Default.FlashOn
         ImageCapture.FLASH_MODE_OFF -> Icons.Default.FlashOff
         else -> Icons.Default.FlashAuto
     }
     Row(modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+        // Left: flash
         CircleIconButton(flashIcon, if (flashMode == ImageCapture.FLASH_MODE_OFF) AccentDim else TextMuted, onClick = onFlashToggle)
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+
+        // Right: grid, EV, GPS, RAW
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             CircleIconButton(Icons.Default.GridOn, if (showGrid) TextPrimary else TextMuted, onClick = onGridToggle)
             CircleIconButton(Icons.Default.Brightness6, TextMuted, onClick = onExposureToggle)
+            CircleIconButton(Icons.Default.LocationOn, if (enableLocation) TextPrimary else TextMuted, onClick = onLocationToggle)
+            if (isRawSupported) {
+                // RAW 用文字标签（图标不明显）
+                Box(Modifier.size(36.dp).background(Surface2.copy(alpha = 0.6f), CircleShape)
+                    .clickable(remember { MutableInteractionSource() }, null) { onRawToggle() },
+                    contentAlignment = Alignment.Center) {
+                    Text("R", color = if (enableRaw) TextPrimary else TextMuted,
+                        fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                }
+            }
         }
     }
 }
@@ -616,42 +743,27 @@ private fun BottomControls(selectedMode: Int, lastPhotoBitmap: Bitmap?, isRecord
         Spacer(Modifier.height(20.dp))
         Row(Modifier.fillMaxWidth().padding(horizontal = 32.dp),
             horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-            // Gallery thumbnail
             Box(Modifier.size(42.dp).background(Surface2, RoundedCornerShape(8.dp))
                 .clickable(remember { MutableInteractionSource() }, null) { onGalleryClick() },
                 contentAlignment = Alignment.Center) {
                 if (lastPhotoBitmap != null) {
-                    Image(lastPhotoBitmap.asImageBitmap(), null,
-                        Modifier.size(42.dp).clip(RoundedCornerShape(8.dp)), contentScale = ContentScale.Crop)
+                    Image(lastPhotoBitmap.asImageBitmap(), null, Modifier.size(42.dp).clip(RoundedCornerShape(8.dp)), contentScale = ContentScale.Crop)
                 } else {
                     Icon(Icons.Default.GridOn, null, tint = TextMuted, modifier = Modifier.size(20.dp))
                 }
             }
-
-            // Shutter / Record button
             if (selectedMode == 0) {
-                // Video: square stop button when recording, circle when idle
-                Box(
-                    Modifier.size(72.dp).border(3.dp, if (isRecording) Danger else TextPrimary, CircleShape)
-                        .clickable(remember { MutableInteractionSource() }, null) { onShutter() },
-                    contentAlignment = Alignment.Center
-                ) {
-                    if (isRecording) {
-                        Box(Modifier.size(28.dp).background(Danger, RoundedCornerShape(4.dp)))
-                    } else {
-                        Box(Modifier.size(60.dp).background(Danger, CircleShape))
-                    }
+                Box(Modifier.size(72.dp).border(3.dp, if (isRecording) Danger else TextPrimary, CircleShape)
+                    .clickable(remember { MutableInteractionSource() }, null) { onShutter() }, contentAlignment = Alignment.Center) {
+                    if (isRecording) Box(Modifier.size(28.dp).background(Danger, RoundedCornerShape(4.dp)))
+                    else Box(Modifier.size(60.dp).background(Danger, CircleShape))
                 }
             } else {
-                // Photo / Portrait: white shutter
                 Box(Modifier.size(72.dp).border(3.dp, TextPrimary, CircleShape)
-                    .clickable(remember { MutableInteractionSource() }, null) { onShutter() },
-                    contentAlignment = Alignment.Center) {
+                    .clickable(remember { MutableInteractionSource() }, null) { onShutter() }, contentAlignment = Alignment.Center) {
                     Box(Modifier.size(60.dp).background(TextPrimary, CircleShape))
                 }
             }
-
-            // Switch camera
             CircleIconButton(Icons.Default.Cameraswitch, TextPrimary, size = 42, onClick = onSwitchCamera)
         }
     }
@@ -676,8 +788,7 @@ private fun ReviewScreen(processedBytes: ByteArray?, isProcessing: Boolean, sele
 @Composable
 private fun CircleIconButton(icon: ImageVector, tint: Color, size: Int = 36, onClick: () -> Unit) {
     Box(Modifier.size(size.dp).background(Surface2.copy(alpha = 0.6f), CircleShape)
-        .clickable(remember { MutableInteractionSource() }, null) { onClick() },
-        contentAlignment = Alignment.Center) {
+        .clickable(remember { MutableInteractionSource() }, null) { onClick() }, contentAlignment = Alignment.Center) {
         Icon(icon, null, tint = tint, modifier = Modifier.size((size * 0.5).dp))
     }
 }
@@ -695,13 +806,11 @@ private fun ProcessingBadge(modifier: Modifier) {
 private fun ReviewControls(selectedFilter: FilterType, onSelectFilter: (FilterType) -> Unit,
     onRetake: () -> Unit, onSave: () -> Unit, modifier: Modifier) {
     Column(modifier.fillMaxWidth()) {
-        LazyRow(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp),
-            contentPadding = PaddingValues(horizontal = 20.dp)) {
+        LazyRow(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp), contentPadding = PaddingValues(horizontal = 20.dp)) {
             items(RustBridge.supportedFilters()) { filter ->
                 val active = selectedFilter == filter
-                Text(RustBridge.filterName(filter), color = if (active) Bg else TextMuted,
-                    fontSize = 12.sp, fontWeight = FontWeight.Medium, letterSpacing = 0.2.sp,
-                    modifier = Modifier.clip(RoundedCornerShape(14.dp))
+                Text(RustBridge.filterName(filter), color = if (active) Bg else TextMuted, fontSize = 12.sp, fontWeight = FontWeight.Medium,
+                    letterSpacing = 0.2.sp, modifier = Modifier.clip(RoundedCornerShape(14.dp))
                         .background(if (active) TextPrimary else Color.Transparent)
                         .then(if (!active) Modifier.border(1.5.dp, AccentDim, RoundedCornerShape(14.dp)) else Modifier)
                         .clickable(remember { MutableInteractionSource() }, null) { onSelectFilter(filter) }
@@ -709,14 +818,11 @@ private fun ReviewControls(selectedFilter: FilterType, onSelectFilter: (FilterTy
             }
         }
         Spacer(Modifier.height(12.dp))
-        Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp),
-            horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-            TextButton(onRetake, colors = ButtonDefaults.textButtonColors(contentColor = TextPrimary),
-                shape = RoundedCornerShape(20.dp), contentPadding = PaddingValues(horizontal = 24.dp, vertical = 10.dp)) {
-                Text("Retake", fontSize = 14.sp, fontWeight = FontWeight.Medium) }
-            Button(onSave, colors = ButtonDefaults.buttonColors(containerColor = TextPrimary),
-                shape = RoundedCornerShape(20.dp), contentPadding = PaddingValues(horizontal = 28.dp, vertical = 10.dp)) {
-                Text("Save", color = Bg, fontSize = 14.sp, fontWeight = FontWeight.SemiBold) }
+        Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+            TextButton(onRetake, colors = ButtonDefaults.textButtonColors(contentColor = TextPrimary), shape = RoundedCornerShape(20.dp),
+                contentPadding = PaddingValues(horizontal = 24.dp, vertical = 10.dp)) { Text("Retake", fontSize = 14.sp, fontWeight = FontWeight.Medium) }
+            Button(onSave, colors = ButtonDefaults.buttonColors(containerColor = TextPrimary), shape = RoundedCornerShape(20.dp),
+                contentPadding = PaddingValues(horizontal = 28.dp, vertical = 10.dp)) { Text("Save", color = Bg, fontSize = 14.sp, fontWeight = FontWeight.SemiBold) }
         }
     }
 }
