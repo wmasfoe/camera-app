@@ -3,6 +3,7 @@ package com.camera.app.ui
 import android.Manifest
 import android.content.ContentUris
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -24,9 +25,13 @@ import androidx.camera.core.FocusMeteringAction
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.ImageProxy
-import androidx.camera.core.MeteringPointFactory
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.video.FileOutputOptions
+import androidx.camera.video.Recorder
+import androidx.camera.video.Recording
+import androidx.camera.video.VideoCapture
+import androidx.camera.video.VideoRecordEvent
 import androidx.camera.view.PreviewView
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
@@ -74,6 +79,10 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import uniffi.camera_shared_core.FilterType
 import java.io.ByteArrayOutputStream
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
@@ -86,6 +95,7 @@ private val TextPrimary = Color(0xFFFFFFFF)
 private val TextMuted = Color(0xFF8E8E93)
 private val AccentDim = Color(0xFF636366)
 private val GridColor = Color(0x33FFFFFF)
+private val Danger = Color(0xFFFF453A)
 
 // ── Main ─────────────────────────────────────────────────────────────
 
@@ -95,27 +105,43 @@ fun CameraScreen() {
     val scope = rememberCoroutineScope()
 
     var hasCameraPermission by remember {
-        mutableStateOf(
-            ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA)
-                == PackageManager.PERMISSION_GRANTED
-        )
+        mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED)
+    }
+    var hasAudioPermission by remember {
+        mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED)
     }
 
+    // Photo state
     var capturedBytes by remember { mutableStateOf<ByteArray?>(null) }
     var processedBytes by remember { mutableStateOf<ByteArray?>(null) }
     var selectedFilter by remember { mutableStateOf(FilterType.NONE) }
     var isProcessing by remember { mutableStateOf(false) }
+
+    // Camera controls
     var isFrontCamera by remember { mutableStateOf(false) }
     var flashMode by remember { mutableIntStateOf(ImageCapture.FLASH_MODE_AUTO) }
-    var selectedMode by remember { mutableIntStateOf(1) }
+    var selectedMode by remember { mutableIntStateOf(1) } // 0=Video, 1=Photo, 2=Portrait
     var zoomRatio by remember { mutableFloatStateOf(1f) }
     var showGrid by remember { mutableStateOf(false) }
+    var exposureComp by remember { mutableFloatStateOf(0f) } // -1.0 to 1.0
+    var showExposureSlider by remember { mutableStateOf(false) }
+
+    // Focus
     var focusPoint by remember { mutableStateOf<Offset?>(null) }
     var showFocusRing by remember { mutableStateOf(false) }
+
+    // Shutter flash
     var showFlash by remember { mutableStateOf(false) }
+
+    // Video recording
+    var isRecording by remember { mutableStateOf(false) }
+    var recordingDuration by remember { mutableIntStateOf(0) }
+    var activeRecording by remember { mutableStateOf<Recording?>(null) }
+
+    // Last photo
     var lastPhotoBitmap by remember { mutableStateOf<Bitmap?>(null) }
 
-    // Camera 引用
+    // Camera refs
     var camera by remember { mutableStateOf<Camera?>(null) }
     var previewViewRef by remember { mutableStateOf<PreviewView?>(null) }
 
@@ -127,28 +153,52 @@ fun CameraScreen() {
             .build()
     }
 
-    val captureExecutor = remember { Executors.newSingleThreadExecutor() }
-    val vibrator = remember {
-        context.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+    val videoCapture = remember {
+        val recorder = Recorder.Builder()
+            .setQualitySelector(androidx.camera.video.QualitySelector.from(
+                androidx.camera.video.Quality.HD,
+                androidx.camera.video.FallbackStrategy.higherQualityOrLowerThan(androidx.camera.video.Quality.SD)
+            ))
+            .build()
+        VideoCapture.withOutput(recorder)
     }
 
-    val launcher = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { granted -> hasCameraPermission = granted }
+    val captureExecutor = remember { Executors.newSingleThreadExecutor() }
+    val vibrator = remember { context.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator }
+
+    val permissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { results ->
+        hasCameraPermission = results[Manifest.permission.CAMERA] == true
+        hasAudioPermission = results[Manifest.permission.RECORD_AUDIO] == true
+    }
 
     LaunchedEffect(Unit) {
-        if (!hasCameraPermission) launcher.launch(Manifest.permission.CAMERA)
+        if (!hasCameraPermission || !hasAudioPermission) {
+            permissionLauncher.launch(arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO))
+        }
         lastPhotoBitmap = loadLastPhotoThumbnail(context)
     }
 
-    // 对焦环消失
+    // Focus ring disappear
     LaunchedEffect(showFocusRing) {
         if (showFocusRing) { delay(1200); showFocusRing = false }
     }
 
-    // 快门闪白
+    // Shutter flash
     LaunchedEffect(showFlash) {
         if (showFlash) { delay(120); showFlash = false }
+    }
+
+    // Recording timer
+    LaunchedEffect(isRecording) {
+        if (isRecording) {
+            recordingDuration = 0
+            while (isRecording) {
+                delay(1000)
+                recordingDuration++
+            }
+        }
     }
 
     // ── Actions ──
@@ -174,6 +224,43 @@ fun CameraScreen() {
         })
     }
 
+    fun startRecording() {
+        val ctx = context
+        val videoDir = File(ctx.getExternalFilesDir(null), "videos").apply { mkdirs() }
+        val ts = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        val videoFile = File(videoDir, "VID_$ts.mp4")
+
+        val outputOptions = FileOutputOptions.Builder(videoFile).build()
+
+        activeRecording = videoCapture.output
+            .prepareRecording(ctx, outputOptions)
+            .apply { if (hasAudioPermission) withAudioEnabled() }
+            .start(ContextCompat.getMainExecutor(ctx)) { event ->
+                if (event is VideoRecordEvent.Finalize) {
+                    if (event.hasError()) {
+                        scope.launch { Toast.makeText(ctx, "Recording failed", Toast.LENGTH_SHORT).show() }
+                    } else {
+                        // Save to gallery
+                        scope.launch {
+                            val uri = PhotoSaver.saveVideoToGallery(ctx, videoFile)
+                            if (uri != null) {
+                                Toast.makeText(ctx, "Video saved", Toast.LENGTH_SHORT).show()
+                            }
+                            lastPhotoBitmap = loadLastPhotoThumbnail(ctx)
+                        }
+                    }
+                }
+            }
+
+        isRecording = true
+    }
+
+    fun stopRecording() {
+        activeRecording?.stop()
+        activeRecording = null
+        isRecording = false
+    }
+
     fun onTapToFocus(x: Float, y: Float) {
         focusPoint = Offset(x, y)
         showFocusRing = true
@@ -194,16 +281,22 @@ fun CameraScreen() {
         ctrl.setZoomRatio(zoomRatio)
     }
 
+    fun setExposure(value: Float) {
+        exposureComp = value
+        val ctrl = camera?.cameraControl ?: return
+        val range = ctrl.exposureState.exposureCompensationRange
+        val index = (value * (range.upper - range.lower) / 2 + (range.upper + range.lower) / 2).toInt()
+            .coerceIn(range.lower, range.upper)
+        ctrl.setExposureCompensationIndex(index)
+    }
+
     fun applyFilter(filter: FilterType) {
         val bytes = capturedBytes ?: return
         selectedFilter = filter
         scope.launch {
             isProcessing = true
-            if (filter == FilterType.NONE) {
-                processedBytes = bytes
-            } else {
-                RustBridge.applyFilter(bytes, filter).onSuccess { processedBytes = it }
-            }
+            if (filter == FilterType.NONE) processedBytes = bytes
+            else RustBridge.applyFilter(bytes, filter).onSuccess { processedBytes = it }
             isProcessing = false
         }
     }
@@ -231,14 +324,22 @@ fun CameraScreen() {
     }
 
     fun switchCamera() {
-        isFrontCamera = !isFrontCamera; zoomRatio = 1f
+        isFrontCamera = !isFrontCamera; zoomRatio = 1f; exposureComp = 0f
+    }
+
+    fun openGallery() {
+        val intent = Intent(Intent.ACTION_VIEW, MediaStore.Images.Media.EXTERNAL_CONTENT_URI)
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        try { context.startActivity(intent) } catch (_: Exception) {
+            Toast.makeText(context, "No gallery app found", Toast.LENGTH_SHORT).show()
+        }
     }
 
     // ── UI ──
 
     Box(Modifier.fillMaxSize().background(Bg)) {
         if (!hasCameraPermission) {
-            PermissionScreen { launcher.launch(Manifest.permission.CAMERA) }
+            PermissionScreen { permissionLauncher.launch(arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)) }
             return@Box
         }
 
@@ -249,18 +350,30 @@ fun CameraScreen() {
                 onSave = { save() })
         } else {
             ViewfinderScreen(
-                imageCapture, isFrontCamera, zoomRatio, showGrid,
+                imageCapture, videoCapture, isFrontCamera, zoomRatio, showGrid,
                 showFocusRing, focusPoint, showFlash, flashMode,
                 selectedMode, lastPhotoBitmap,
+                isRecording, recordingDuration,
+                showExposureSlider, exposureComp,
                 onCameraReady = { c, pv -> camera = c; previewViewRef = pv },
                 onTap = { x, y -> onTapToFocus(x, y) },
                 onZoom = { onZoom(it) },
-                onShutter = { takePhoto() },
+                onShutter = {
+                    when (selectedMode) {
+                        0 -> { if (isRecording) stopRecording() else startRecording() }
+                        else -> takePhoto()
+                    }
+                },
                 onFlashToggle = { toggleFlash() },
                 onSwitchCamera = { switchCamera() },
-                onModeChange = { selectedMode = it },
+                onModeChange = {
+                    if (isRecording) stopRecording()
+                    selectedMode = it
+                },
                 onGridToggle = { showGrid = !showGrid },
-                onGalleryClick = { /* TODO */ }
+                onGalleryClick = { openGallery() },
+                onExposureToggle = { showExposureSlider = !showExposureSlider },
+                onExposureChange = { setExposure(it) }
             )
         }
     }
@@ -275,7 +388,7 @@ private fun PermissionScreen(onRequest: () -> Unit) {
         Spacer(Modifier.height(8.dp))
         Text("Grant permission to start taking photos", color = TextMuted, fontSize = 13.sp)
         Spacer(Modifier.height(16.dp))
-        Button(onClick = onRequest, colors = ButtonDefaults.buttonColors(containerColor = TextPrimary),
+        Button(onRequest, colors = ButtonDefaults.buttonColors(containerColor = TextPrimary),
             shape = RoundedCornerShape(20.dp), contentPadding = PaddingValues(horizontal = 24.dp, vertical = 10.dp)) {
             Text("Allow", color = Bg, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
         }
@@ -287,6 +400,7 @@ private fun PermissionScreen(onRequest: () -> Unit) {
 @Composable
 private fun ViewfinderScreen(
     imageCapture: ImageCapture,
+    videoCapture: VideoCapture<Recorder>,
     isFrontCamera: Boolean,
     zoomRatio: Float,
     showGrid: Boolean,
@@ -296,6 +410,10 @@ private fun ViewfinderScreen(
     flashMode: Int,
     selectedMode: Int,
     lastPhotoBitmap: Bitmap?,
+    isRecording: Boolean,
+    recordingDuration: Int,
+    showExposureSlider: Boolean,
+    exposureComp: Float,
     onCameraReady: (Camera, PreviewView) -> Unit,
     onTap: (Float, Float) -> Unit,
     onZoom: (Float) -> Unit,
@@ -304,14 +422,16 @@ private fun ViewfinderScreen(
     onSwitchCamera: () -> Unit,
     onModeChange: (Int) -> Unit,
     onGridToggle: () -> Unit,
-    onGalleryClick: () -> Unit
+    onGalleryClick: () -> Unit,
+    onExposureToggle: () -> Unit,
+    onExposureChange: (Float) -> Unit
 ) {
     Box(Modifier.fillMaxSize()) {
-        // Preview (4:3, centered, pinch-to-zoom)
+        // Preview
         Box(Modifier.fillMaxSize().pointerInput(Unit) {
             detectTransformGestures { _, _, zoom, _ -> if (zoom != 1f) onZoom(zoom) }
         }) {
-            CameraPreviewWithFocus(imageCapture, isFrontCamera, showGrid, showFocusRing, focusPoint,
+            CameraPreviewWithFocus(imageCapture, videoCapture, isFrontCamera, showGrid, showFocusRing, focusPoint,
                 onTap, onCameraReady,
                 Modifier.fillMaxWidth().aspectRatio(3f / 4f).align(Alignment.Center))
         }
@@ -320,7 +440,7 @@ private fun ViewfinderScreen(
         if (showFlash) Box(Modifier.fillMaxSize().background(Color.White.copy(alpha = 0.7f)))
 
         // Top bar
-        TopBar(flashMode, showGrid, onFlashToggle, onGridToggle,
+        TopBar(flashMode, showGrid, onFlashToggle, onGridToggle, onExposureToggle,
             Modifier.align(Alignment.TopStart).statusBarsPadding().padding(horizontal = 16.dp, vertical = 8.dp))
 
         // Zoom indicator
@@ -332,17 +452,31 @@ private fun ViewfinderScreen(
                     .padding(horizontal = 10.dp, vertical = 4.dp))
         }
 
+        // Exposure slider (vertical, right side)
+        if (showExposureSlider) {
+            ExposureSlider(exposureComp, onExposureChange,
+                Modifier.align(Alignment.CenterEnd).padding(end = 16.dp))
+        }
+
+        // Recording indicator
+        if (isRecording) {
+            RecordingIndicator(recordingDuration,
+                Modifier.align(Alignment.TopCenter).statusBarsPadding().padding(top = 12.dp))
+        }
+
         // Bottom controls
-        BottomControls(selectedMode, lastPhotoBitmap, onModeChange, onShutter, onSwitchCamera, onGalleryClick,
+        BottomControls(selectedMode, lastPhotoBitmap, isRecording,
+            onModeChange, onShutter, onSwitchCamera, onGalleryClick,
             Modifier.align(Alignment.BottomStart).navigationBarsPadding().padding(bottom = 24.dp))
     }
 }
 
-// ── Camera Preview with Focus & Grid ─────────────────────────────────
+// ── Camera Preview ───────────────────────────────────────────────────
 
 @Composable
 private fun CameraPreviewWithFocus(
     imageCapture: ImageCapture,
+    videoCapture: VideoCapture<Recorder>,
     isFrontCamera: Boolean,
     showGrid: Boolean,
     showFocusRing: Boolean,
@@ -375,7 +509,7 @@ private fun CameraPreviewWithFocus(
                     val selector = if (isFrontCamera) CameraSelector.DEFAULT_FRONT_CAMERA else CameraSelector.DEFAULT_BACK_CAMERA
                     try {
                         provider.unbindAll()
-                        val cam = provider.bindToLifecycle(lifecycleOwner, selector, preview, imageCapture)
+                        val cam = provider.bindToLifecycle(lifecycleOwner, selector, preview, imageCapture, videoCapture)
                         onCameraReady(cam, pv)
                     } catch (_: Exception) {}
                 }, ContextCompat.getMainExecutor(context))
@@ -411,10 +545,45 @@ private fun FocusRing(point: Offset) {
     }
 }
 
+// ── Exposure Slider ──────────────────────────────────────────────────
+
+@Composable
+private fun ExposureSlider(value: Float, onChange: (Float) -> Unit, modifier: Modifier) {
+    Column(modifier.width(36.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+        Icon(Icons.Default.Brightness6, null, tint = TextPrimary, modifier = Modifier.size(16.dp))
+        Spacer(Modifier.height(8.dp))
+        Slider(
+            value = value,
+            onValueChange = onChange,
+            valueRange = -1f..1f,
+            modifier = Modifier.height(200.dp),
+            colors = SliderDefaults.colors(
+                thumbColor = TextPrimary,
+                activeTrackColor = TextPrimary,
+                inactiveTrackColor = AccentDim
+            )
+        )
+    }
+}
+
+// ── Recording Indicator ──────────────────────────────────────────────
+
+@Composable
+private fun RecordingIndicator(duration: Int, modifier: Modifier) {
+    val min = duration / 60
+    val sec = duration % 60
+    Row(modifier.background(Surface.copy(alpha = 0.8f), RoundedCornerShape(14.dp)).padding(horizontal = 12.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Box(Modifier.size(8.dp).background(Danger, CircleShape))
+        Text("%d:%02d".format(min, sec), color = TextPrimary, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+    }
+}
+
 // ── TopBar ───────────────────────────────────────────────────────────
 
 @Composable
-private fun TopBar(flashMode: Int, showGrid: Boolean, onFlashToggle: () -> Unit, onGridToggle: () -> Unit, modifier: Modifier) {
+private fun TopBar(flashMode: Int, showGrid: Boolean,
+    onFlashToggle: () -> Unit, onGridToggle: () -> Unit, onExposureToggle: () -> Unit, modifier: Modifier) {
     val flashIcon = when (flashMode) {
         ImageCapture.FLASH_MODE_ON -> Icons.Default.FlashOn
         ImageCapture.FLASH_MODE_OFF -> Icons.Default.FlashOff
@@ -424,7 +593,7 @@ private fun TopBar(flashMode: Int, showGrid: Boolean, onFlashToggle: () -> Unit,
         CircleIconButton(flashIcon, if (flashMode == ImageCapture.FLASH_MODE_OFF) AccentDim else TextMuted, onClick = onFlashToggle)
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             CircleIconButton(Icons.Default.GridOn, if (showGrid) TextPrimary else TextMuted, onClick = onGridToggle)
-            CircleIconButton(Icons.Default.Brightness6, TextMuted, onClick = { /* TODO EV */ })
+            CircleIconButton(Icons.Default.Brightness6, TextMuted, onClick = onExposureToggle)
         }
     }
 }
@@ -432,7 +601,7 @@ private fun TopBar(flashMode: Int, showGrid: Boolean, onFlashToggle: () -> Unit,
 // ── Bottom Controls ──────────────────────────────────────────────────
 
 @Composable
-private fun BottomControls(selectedMode: Int, lastPhotoBitmap: Bitmap?,
+private fun BottomControls(selectedMode: Int, lastPhotoBitmap: Bitmap?, isRecording: Boolean,
     onModeChange: (Int) -> Unit, onShutter: () -> Unit, onSwitchCamera: () -> Unit, onGalleryClick: () -> Unit, modifier: Modifier) {
     val modes = listOf("Video", "Photo", "Portrait")
     Column(modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
@@ -446,7 +615,7 @@ private fun BottomControls(selectedMode: Int, lastPhotoBitmap: Bitmap?,
         Spacer(Modifier.height(20.dp))
         Row(Modifier.fillMaxWidth().padding(horizontal = 32.dp),
             horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-            // Last photo thumbnail
+            // Gallery thumbnail
             Box(Modifier.size(42.dp).background(Surface2, RoundedCornerShape(8.dp))
                 .clickable(remember { MutableInteractionSource() }, null) { onGalleryClick() },
                 contentAlignment = Alignment.Center) {
@@ -457,12 +626,30 @@ private fun BottomControls(selectedMode: Int, lastPhotoBitmap: Bitmap?,
                     Icon(Icons.Default.GridOn, null, tint = TextMuted, modifier = Modifier.size(20.dp))
                 }
             }
-            // Shutter
-            Box(Modifier.size(72.dp).border(3.dp, TextPrimary, CircleShape)
-                .clickable(remember { MutableInteractionSource() }, null) { onShutter() },
-                contentAlignment = Alignment.Center) {
-                Box(Modifier.size(60.dp).background(TextPrimary, CircleShape))
+
+            // Shutter / Record button
+            if (selectedMode == 0) {
+                // Video: square stop button when recording, circle when idle
+                Box(
+                    Modifier.size(72.dp).border(3.dp, if (isRecording) Danger else TextPrimary, CircleShape)
+                        .clickable(remember { MutableInteractionSource() }, null) { onShutter() },
+                    contentAlignment = Alignment.Center
+                ) {
+                    if (isRecording) {
+                        Box(Modifier.size(28.dp).background(Danger, RoundedCornerShape(4.dp)))
+                    } else {
+                        Box(Modifier.size(60.dp).background(Danger, CircleShape))
+                    }
+                }
+            } else {
+                // Photo / Portrait: white shutter
+                Box(Modifier.size(72.dp).border(3.dp, TextPrimary, CircleShape)
+                    .clickable(remember { MutableInteractionSource() }, null) { onShutter() },
+                    contentAlignment = Alignment.Center) {
+                    Box(Modifier.size(60.dp).background(TextPrimary, CircleShape))
+                }
             }
+
             // Switch camera
             CircleIconButton(Icons.Default.Cameraswitch, TextPrimary, size = 42, onClick = onSwitchCamera)
         }
@@ -533,20 +720,18 @@ private fun ReviewControls(selectedFilter: FilterType, onSelectFilter: (FilterTy
     }
 }
 
-// ── ImageProxy → JPEG (带旋转) ──────────────────────────────────────
+// ── ImageProxy → JPEG ────────────────────────────────────────────────
 
 private fun imageProxyToJpegBytes(image: ImageProxy): ByteArray {
     val rotation = image.imageInfo.rotationDegrees
     val jpegBytes = if (image.format == ImageFormat.JPEG) {
-        val buf = image.planes[0].buffer
-        ByteArray(buf.remaining()).also { buf.get(it) }
+        val buf = image.planes[0].buffer; ByteArray(buf.remaining()).also { buf.get(it) }
     } else {
         val y = image.planes[0].buffer; val u = image.planes[1].buffer; val v = image.planes[2].buffer
         val nv21 = ByteArray(y.remaining() + u.remaining() + v.remaining())
         y.get(nv21, 0, y.remaining()); v.get(nv21, y.remaining(), v.remaining()); u.get(nv21, y.remaining() + v.remaining(), u.remaining())
         val out = ByteArrayOutputStream()
-        YuvImage(nv21, ImageFormat.NV21, image.width, image.height, null)
-            .compressToJpeg(Rect(0, 0, image.width, image.height), 95, out)
+        YuvImage(nv21, ImageFormat.NV21, image.width, image.height, null).compressToJpeg(Rect(0, 0, image.width, image.height), 95, out)
         out.toByteArray()
     }
     return if (rotation != 0) rotateJpeg(jpegBytes, rotation) else jpegBytes
@@ -556,9 +741,7 @@ private fun rotateJpeg(bytes: ByteArray, degrees: Int): ByteArray {
     val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return bytes
     val rotated = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, Matrix().apply { postRotate(degrees.toFloat()) }, true)
     bmp.recycle()
-    val out = ByteArrayOutputStream()
-    rotated.compress(Bitmap.CompressFormat.JPEG, 95, out)
-    rotated.recycle()
+    val out = ByteArrayOutputStream(); rotated.compress(Bitmap.CompressFormat.JPEG, 95, out); rotated.recycle()
     return out.toByteArray()
 }
 
@@ -566,8 +749,7 @@ private fun rotateJpeg(bytes: ByteArray, degrees: Int): ByteArray {
 
 private fun loadLastPhotoThumbnail(ctx: Context): Bitmap? {
     val uri = ctx.contentResolver.query(
-        MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-        arrayOf(MediaStore.Images.Media._ID),
+        MediaStore.Images.Media.EXTERNAL_CONTENT_URI, arrayOf(MediaStore.Images.Media._ID),
         "${MediaStore.Images.Media.RELATIVE_PATH} LIKE ?", arrayOf("%Pictures/CameraApp%"),
         "${MediaStore.Images.Media.DATE_ADDED} DESC"
     )?.use { c ->

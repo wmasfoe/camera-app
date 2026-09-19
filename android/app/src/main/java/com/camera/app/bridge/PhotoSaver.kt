@@ -114,6 +114,58 @@ object PhotoSaver {
         return BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
     }
 
+    /**
+     * 保存视频到系统相册
+     */
+    suspend fun saveVideoToGallery(
+        context: Context,
+        videoFile: File,
+        displayName: String? = null
+    ): Uri? = withContext(Dispatchers.IO) {
+        val name = displayName ?: generateFileName()
+
+        val contentValues = ContentValues().apply {
+            put(MediaStore.Video.Media.DISPLAY_NAME, "$name.mp4")
+            put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/CameraApp")
+                put(MediaStore.Video.Media.IS_PENDING, 1)
+            }
+            put(MediaStore.Video.Media.DATE_ADDED, System.currentTimeMillis() / 1000)
+            put(MediaStore.Video.Media.DATE_MODIFIED, System.currentTimeMillis() / 1000)
+        }
+
+        val resolver = context.contentResolver
+        val collection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+        } else {
+            MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+        }
+
+        val uri = resolver.insert(collection, contentValues) ?: return@withContext null
+
+        try {
+            resolver.openOutputStream(uri)?.use { stream ->
+                videoFile.inputStream().use { input ->
+                    input.copyTo(stream)
+                }
+                stream.flush()
+            } ?: return@withContext null.also { resolver.delete(uri, null, null) }
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                contentValues.clear()
+                contentValues.put(MediaStore.Video.Media.IS_PENDING, 0)
+                resolver.update(uri, contentValues, null, null)
+            }
+
+            uri
+        } catch (e: Exception) {
+            resolver.delete(uri, null, null)
+            null
+        }
+    }
+
     private fun generateFileName(): String {
         val sdf = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US)
         return "IMG_${sdf.format(Date())}"
