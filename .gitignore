@@ -1,7 +1,8 @@
-# Rust
+# ── Rust ──────────────────────────────────────────────────────────────
+target/
 shared-core/target/
 
-# Android
+# ── Android ──────────────────────────────────────────────────────────
 android/.gradle/
 android/build/
 android/app/build/
@@ -9,24 +10,31 @@ android/local.properties
 *.apk
 *.aab
 
-# iOS
+# 生成的 Rust 绑定和 .so (CI 构建，不提交)
+android/app/src/main/jniLibs/
+android/app/src/main/java/uniffi/
+
+# ── iOS ──────────────────────────────────────────────────────────────
 ios/build/
 ios/DerivedData/
 *.xcworkspace/xcuserdata/
 *.xcodeproj/xcuserdata/
 ios/Pods/
 
-# IDE
+# 生成的 Swift 绑定 (CI 构建，不提交)
+ios/CameraApp/Generated/
+
+# ── IDE ──────────────────────────────────────────────────────────────
 .idea/
 *.iml
 .vscode/
+*.swp
+*~
 
-# OS
+# ── OS ───────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
 
-# jniLibs 里的 .so 由构建系统生成，不提交
-android/app/src/main/jniLibs/
-
-# iOS 生成的绑定
-ios/CameraApp/Generated/
+# ── Cargo ────────────────────────────────────────────────────────────
+# 保留 Cargo.lock (bin 项目应该提交)
+# Cargo.lock

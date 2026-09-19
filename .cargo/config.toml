@@ -1,0 +1,20 @@
+# Rust 交叉编译配置
+# Android: 使用 cargo-ndk (推荐) 或设置 ANDROID_NDK_HOME 环境变量
+#
+# cargo-ndk 方式 (无需此配置):
+#   cargo ndk -t arm64-v8a build --release
+#
+# 手动方式 (设置环境变量后可用):
+#   export ANDROID_NDK_HOME=/path/to/ndk
+#   cargo build --target aarch64-linux-android --release
+
+[target.aarch64-linux-android]
+linker = "aarch64-linux-android24-clang"
+ar = "llvm-ar"
+
+[target.aarch64-apple-ios]
+# macOS 上 Xcode 自带工具链，无需额外配置
+
+[build]
+# cargo-ndk 会自动设置这些，手动编译时需要 NDK 在 PATH 中
+target-dir = "target"
