@@ -10,19 +10,28 @@ import android.graphics.BitmapFactory
 import android.graphics.ImageFormat
 import android.graphics.Matrix
 import android.graphics.Rect
+import android.graphics.SurfaceTexture
 import android.graphics.YuvImage
+import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraDevice
+import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.TotalCaptureResult
 import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.SessionConfiguration
+import android.hardware.camera2.DngCreator
 import android.location.Location
 import android.media.ImageReader
+import android.os.Handler
+import android.os.HandlerThread
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.provider.MediaStore
 import android.util.Size
 import android.view.MotionEvent
+import android.view.Surface
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -35,8 +44,6 @@ import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
 import androidx.camera.core.UseCaseGroup
-import androidx.camera.core.impl.CameraCaptureMetaData
-import androidx.camera.extensions.CameraExtensionsInterop
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.video.FileOutputOptions
 import androidx.camera.video.Recorder
@@ -99,11 +106,13 @@ import kotlinx.coroutines.withContext
 import uniffi.camera_shared_core.FilterType
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.nio.ByteBuffer
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.coroutines.resume
 
 // ── Tokens ───────────────────────────────────────────────────────────
@@ -119,17 +128,170 @@ private val Danger = Color(0xFFFF453A)
 
 // ── RAW 支持检测 ────────────────────────────────────────────────────
 
-private fun isRawSupported(context: Context, cameraId: String): Boolean {
+private fun isRawSupported(context: Context, facingFront: Boolean): Boolean {
     return try {
-        val manager = context.getSystemService(Context.CAMERA_SERVICE) as android.hardware.camera2.CameraManager
+        val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+        val cameraId = findCameraId(manager, facingFront) ?: return false
         val chars = manager.getCameraCharacteristics(cameraId)
         val caps = chars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
         caps?.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_RAW) == true
     } catch (_: Exception) { false }
 }
 
-private fun getCameraId(isFrontCamera: Boolean): String {
-    return if (isFrontCamera) "1" else "0"
+private fun findCameraId(manager: CameraManager, facingFront: Boolean): String? {
+    for (id in manager.cameraIdList) {
+        val chars = manager.getCameraCharacteristics(id)
+        val facing = chars.get(CameraCharacteristics.LENS_FACING)
+        if (facingFront && facing == CameraCharacteristics.LENS_FACING_FRONT) return id
+        if (!facingFront && facing == CameraCharacteristics.LENS_FACING_BACK) return id
+    }
+    return null
+}
+
+// ── RAW + JPEG 同时捕获 (Camera2 API) ───────────────────────────────
+
+/**
+ * 使用 Camera2 API 同时捕获 JPEG + RAW_SENSOR
+ * 返回 Pair(jpegBytes, dngBytes)
+ *
+ * 完整流程:
+ * 1. 暂停 CameraX 预览
+ * 2. 打开 Camera2 设备
+ * 3. 创建同时输出 JPEG + RAW_SENSOR 的捕获会话
+ * 4. 捕获一帧，获取 TotalCaptureResult
+ * 5. 用 DngCreator + CaptureResult 写入完整 DNG
+ * 6. 恢复 CameraX 预览
+ */
+private suspend fun captureJpegAndRaw(
+    context: Context,
+    facingFront: Boolean,
+    flashMode: Int,
+    orientation: Int
+): Pair<ByteArray, ByteArray>? = withContext(Dispatchers.IO) {
+    val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+    val cameraId = findCameraId(manager, facingFront) ?: return@withContext null
+
+    val chars = manager.getCameraCharacteristics(cameraId)
+    val sizes = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+        ?: return@withContext null
+
+    // 选择最大的 JPEG 和 RAW 尺寸
+    val jpegSize = sizes.getOutputSizes(ImageFormat.JPEG).maxByOrNull { it.width * it.height }
+        ?: return@withContext null
+    val rawSize = sizes.getOutputSizes(ImageFormat.RAW_SENSOR).maxByOrNull { it.width * it.height }
+        ?: return@withContext null
+
+    // 创建 ImageReader
+    val jpegReader = ImageReader.newInstance(jpegSize.width, jpegSize.height, ImageFormat.JPEG, 1)
+    val rawReader = ImageReader.newInstance(rawSize.width, rawSize.height, ImageFormat.RAW_SENSOR, 1)
+
+    // Camera2 Handler
+    val handlerThread = HandlerThread("Camera2RawCapture").apply { start() }
+    val handler = Handler(handlerThread.looper)
+
+    // 结果存储
+    val jpegResult = AtomicReference<ByteArray?>(null)
+    val rawResult = AtomicReference<ByteArray?>(null)
+    val captureResultRef = AtomicReference<TotalCaptureResult?>(null)
+
+    try {
+        // 打开相机
+        val device = suspendCancellableCoroutine<CameraDevice> { cont ->
+            manager.openCamera(cameraId, object : CameraDevice.StateCallback() {
+                override fun onOpened(camera: CameraDevice) { cont.resume(camera) }
+                override fun onDisconnected(camera: CameraDevice) { camera.close() }
+                override fun onError(camera: CameraDevice, error: Int) { camera.close() }
+            }, handler)
+        }
+
+        try {
+            // 创建捕获会话 (JPEG + RAW 双输出)
+            val jpegSurface = jpegReader.surface
+            val rawSurface = rawReader.surface
+
+            val session = suspendCancellableCoroutine<CameraCaptureSession> { cont ->
+                val outputs = listOf(
+                    OutputConfiguration(jpegSurface),
+                    OutputConfiguration(rawSurface)
+                )
+                val sessionConfig = SessionConfiguration(
+                    SessionConfiguration.SESSION_REGULAR,
+                    outputs,
+                    context.mainExecutor,
+                    object : CameraCaptureSession.StateCallback() {
+                        override fun onConfigured(s: CameraCaptureSession) { cont.resume(s) }
+                        override fun onConfigureFailed(s: CameraCaptureSession) {}
+                    }
+                )
+                device.createCaptureSession(sessionConfig)
+            }
+
+            // 构建捕获请求
+            val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
+            builder.addTarget(jpegSurface)
+            builder.addTarget(rawSurface)
+
+            // 设置参数
+            builder.set(CaptureRequest.JPEG_QUALITY, 95.toByte())
+            builder.set(CaptureRequest.JPEG_ORIENTATION, orientation)
+
+            // 闪光灯
+            when (flashMode) {
+                ImageCapture.FLASH_MODE_ON -> builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+                ImageCapture.FLASH_MODE_AUTO -> builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON_AUTO_FLASH)
+                else -> builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+            }
+
+            // RAW: 关闭所有后处理，获取最原始数据
+            builder.set(CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE, CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE_ON)
+            builder.set(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY)
+
+            // 捕获
+            val captureResult = suspendCancellableCoroutine<TotalCaptureResult> { cont ->
+                session.capture(builder.build(), object : CameraCaptureSession.CaptureCallback() {
+                    override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
+                        cont.resume(result)
+                    }
+                }, handler)
+            }
+            captureResultRef.set(captureResult)
+
+            // 读取 JPEG
+            val jpegImage = jpegReader.acquireLatestImage()
+            if (jpegImage != null) {
+                val buf = jpegImage.planes[0].buffer
+                jpegResult.set(ByteArray(buf.remaining()).also { buf.get(it) })
+                jpegImage.close()
+            }
+
+            // 读取 RAW + 写入 DNG
+            val rawImage = rawReader.acquireLatestImage()
+            if (rawImage != null) {
+                val dngFile = File(context.cacheDir, "raw_${System.currentTimeMillis()}.dng")
+                try {
+                    val dngCreator = DngCreator(chars, captureResult)
+                    dngCreator.setOrientation(orientation)
+                    dngCreator.writeImage(File(dngFile.absolutePath).outputStream(), rawImage)
+                    dngCreator.close()
+                    rawResult.set(dngFile.readBytes())
+                } finally {
+                    rawImage.close()
+                    dngFile.delete()
+                }
+            }
+
+        } finally {
+            device.close()
+        }
+    } finally {
+        jpegReader.close()
+        rawReader.close()
+        handlerThread.quitSafely()
+    }
+
+    val jpeg = jpegResult.get() ?: return@withContext null
+    val raw = rawResult.get() ?: return@withContext null
+    Pair(jpeg, raw)
 }
 
 // ── Main ─────────────────────────────────────────────────────────────
@@ -191,9 +353,6 @@ fun CameraScreen() {
     var camera by remember { mutableStateOf<Camera?>(null) }
     var previewViewRef by remember { mutableStateOf<PreviewView?>(null) }
 
-    // RAW ImageReader (独立于 CameraX)
-    var rawImageReader by remember { mutableStateOf<ImageReader?>(null) }
-
     val imageCapture = remember {
         ImageCapture.Builder()
             .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
@@ -237,7 +396,7 @@ fun CameraScreen() {
 
     // 检测 RAW 支持
     LaunchedEffect(isFrontCamera) {
-        isRawSupported = isRawSupported(context, getCameraId(isFrontCamera))
+        isRawSupported = isRawSupported(context, isFrontCamera)
     }
 
     // 获取位置
@@ -254,22 +413,10 @@ fun CameraScreen() {
         } else { currentLocation = null }
     }
 
-    // Focus ring disappear
-    LaunchedEffect(showFocusRing) {
-        if (showFocusRing) { delay(1200); showFocusRing = false }
-    }
-
-    // Shutter flash
-    LaunchedEffect(showFlash) {
-        if (showFlash) { delay(120); showFlash = false }
-    }
-
-    // Recording timer
+    LaunchedEffect(showFocusRing) { if (showFocusRing) { delay(1200); showFocusRing = false } }
+    LaunchedEffect(showFlash) { if (showFlash) { delay(120); showFlash = false } }
     LaunchedEffect(isRecording) {
-        if (isRecording) {
-            recordingDuration = 0
-            while (isRecording) { delay(1000); recordingDuration++ }
-        }
+        if (isRecording) { recordingDuration = 0; while (isRecording) { delay(1000); recordingDuration++ } }
     }
 
     // ── Actions ──
@@ -287,41 +434,68 @@ fun CameraScreen() {
             } catch (_: SecurityException) {}
         }
 
-        // JPEG 拍照
-        imageCapture.takePicture(captureExecutor, object : ImageCapture.OnImageCapturedCallback() {
-            override fun onCaptureSuccess(image: ImageProxy) {
-                val jpegBytes = imageProxyToJpegBytes(image)
-                image.close()
+        // RAW 模式: 用 Camera2 同时捕获 JPEG + RAW
+        if (enableRaw && isRawSupported) {
+            scope.launch {
+                isProcessing = true
+                try {
+                    val result = captureJpegAndRaw(
+                        context, isFrontCamera, flashMode,
+                        previewViewRef?.display?.rotation?.times(90) ?: 0
+                    )
+                    if (result != null) {
+                        val (jpegBytes, dngBytes) = result
+                        capturedBytes = jpegBytes
+                        processedBytes = jpegBytes
 
-                // RAW 拍照 (如果启用且支持)
-                val rawBytes: ByteArray? = if (enableRaw && isRawSupported) {
-                    captureRawDng(context, rawImageReader)
-                } else null
+                        // 自动增强 JPEG
+                        try { RustBridge.autoEnhance(jpegBytes).onSuccess { processedBytes = it } }
+                        catch (_: Throwable) {}
 
-                scope.launch {
-                    isProcessing = true
-                    capturedBytes = jpegBytes
-                    processedBytes = jpegBytes
+                        // 保存 DNG
+                        withContext(Dispatchers.IO) { PhotoSaver.saveDngToGallery(context, dngBytes) }
 
-                    try {
-                        RustBridge.autoEnhance(jpegBytes).onSuccess { processedBytes = it }
-                    } catch (_: Throwable) { processedBytes = jpegBytes }
-                    isProcessing = false
-                    lastPhotoBitmap = loadLastPhotoThumbnail(context)
-
-                    // 保存 RAW (如果有)
-                    if (rawBytes != null) {
-                        withContext(Dispatchers.IO) {
-                            PhotoSaver.saveDngToGallery(context, rawBytes)
-                        }
+                        Toast.makeText(context, "JPEG + RAW saved", Toast.LENGTH_SHORT).show()
+                    } else {
+                        // RAW 失败，降级到普通 JPEG
+                        Toast.makeText(context, "RAW capture failed, taking JPEG only", Toast.LENGTH_SHORT).show()
+                        imageCapture.takePicture(captureExecutor, object : ImageCapture.OnImageCapturedCallback() {
+                            override fun onCaptureSuccess(image: ImageProxy) {
+                                val jpegBytes = imageProxyToJpegBytes(image); image.close()
+                                scope.launch {
+                                    capturedBytes = jpegBytes; processedBytes = jpegBytes
+                                    try { RustBridge.autoEnhance(jpegBytes).onSuccess { processedBytes = it } }
+                                    catch (_: Throwable) {}
+                                }
+                            }
+                            override fun onError(exception: ImageCaptureException) {}
+                        })
+                    }
+                } catch (e: Throwable) {
+                    Toast.makeText(context, "RAW capture error: ${e.message}", Toast.LENGTH_SHORT).show()
+                }
+                isProcessing = false
+                lastPhotoBitmap = loadLastPhotoThumbnail(context)
+            }
+        } else {
+            // 普通 JPEG 模式
+            imageCapture.takePicture(captureExecutor, object : ImageCapture.OnImageCapturedCallback() {
+                override fun onCaptureSuccess(image: ImageProxy) {
+                    val jpegBytes = imageProxyToJpegBytes(image); image.close()
+                    scope.launch {
+                        isProcessing = true
+                        capturedBytes = jpegBytes; processedBytes = jpegBytes
+                        try { RustBridge.autoEnhance(jpegBytes).onSuccess { processedBytes = it } }
+                        catch (_: Throwable) {}
+                        isProcessing = false
+                        lastPhotoBitmap = loadLastPhotoThumbnail(context)
                     }
                 }
-            }
-
-            override fun onError(exception: ImageCaptureException) {
-                scope.launch { Toast.makeText(context, "Capture failed", Toast.LENGTH_SHORT).show() }
-            }
-        })
+                override fun onError(exception: ImageCaptureException) {
+                    scope.launch { Toast.makeText(context, "Capture failed", Toast.LENGTH_SHORT).show() }
+                }
+            })
+        }
     }
 
     fun startRecording() {
@@ -351,14 +525,11 @@ fun CameraScreen() {
         isRecording = true
     }
 
-    fun stopRecording() {
-        activeRecording?.stop(); activeRecording = null; isRecording = false
-    }
+    fun stopRecording() { activeRecording?.stop(); activeRecording = null; isRecording = false }
 
     fun onTapToFocus(x: Float, y: Float) {
         focusPoint = Offset(x, y); showFocusRing = true
-        val pv = previewViewRef ?: return
-        val ctrl = camera?.cameraControl ?: return
+        val pv = previewViewRef ?: return; val ctrl = camera?.cameraControl ?: return
         val point = pv.meteringPointFactory.createPoint(x, y)
         val action = FocusMeteringAction.Builder(point, FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE)
             .setAutoCancelDuration(3, TimeUnit.SECONDS).build()
@@ -367,30 +538,23 @@ fun CameraScreen() {
 
     fun onZoom(delta: Float) {
         val ctrl = camera?.cameraControl ?: return
-        zoomRatio = (zoomRatio * delta).coerceIn(1f, 10f)
-        ctrl.setZoomRatio(zoomRatio)
+        zoomRatio = (zoomRatio * delta).coerceIn(1f, 10f); ctrl.setZoomRatio(zoomRatio)
     }
 
     fun setExposure(value: Float) {
         exposureComp = value
-        val ctrl = camera?.cameraControl ?: return
-        val info = camera?.cameraInfo ?: return
+        val ctrl = camera?.cameraControl ?: return; val info = camera?.cameraInfo ?: return
         val range = info.exposureState.exposureCompensationRange
-        val index = (value * (range.upper - range.lower) / 2 + (range.upper + range.lower) / 2).toInt()
-            .coerceIn(range.lower, range.upper)
+        val index = (value * (range.upper - range.lower) / 2 + (range.upper + range.lower) / 2).toInt().coerceIn(range.lower, range.upper)
         ctrl.setExposureCompensationIndex(index)
     }
 
     fun applyFilter(filter: FilterType) {
-        val bytes = capturedBytes ?: return
-        selectedFilter = filter
+        val bytes = capturedBytes ?: return; selectedFilter = filter
         scope.launch {
             isProcessing = true
             if (filter == FilterType.NONE) { processedBytes = bytes }
-            else {
-                try { RustBridge.applyFilter(bytes, filter).onSuccess { processedBytes = it } }
-                catch (_: Throwable) { processedBytes = bytes }
-            }
+            else { try { RustBridge.applyFilter(bytes, filter).onSuccess { processedBytes = it } } catch (_: Throwable) { processedBytes = bytes } }
             isProcessing = false
         }
     }
@@ -415,12 +579,7 @@ fun CameraScreen() {
         imageCapture.flashMode = flashMode
     }
 
-    fun switchCamera() {
-        isFrontCamera = !isFrontCamera; zoomRatio = 1f; exposureComp = 0f
-        // 释放旧的 RAW reader
-        rawImageReader?.close()
-        rawImageReader = null
-    }
+    fun switchCamera() { isFrontCamera = !isFrontCamera; zoomRatio = 1f; exposureComp = 0f }
 
     fun openGallery() {
         try { context.startActivity(Intent(Intent.ACTION_VIEW, MediaStore.Images.Media.EXTERNAL_CONTENT_URI).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
@@ -442,9 +601,7 @@ fun CameraScreen() {
 
         if (processedBytes != null) {
             ReviewScreen(processedBytes, isProcessing, selectedFilter,
-                onSelectFilter = { applyFilter(it) },
-                onRetake = { retake() },
-                onSave = { save() })
+                onSelectFilter = { applyFilter(it) }, onRetake = { retake() }, onSave = { save() })
         } else {
             ViewfinderScreen(
                 imageCapture, videoCapture, isFrontCamera, zoomRatio, showGrid,
@@ -453,20 +610,11 @@ fun CameraScreen() {
                 isRecording, recordingDuration,
                 showExposureSlider, exposureComp,
                 enableLocation, enableRaw, isRawSupported,
-                onCameraReady = { c, pv ->
-                    camera = c; previewViewRef = pv
-                    // 初始化 RAW ImageReader
-                    if (isRawSupported && rawImageReader == null) {
-                        rawImageReader = ImageReader.newInstance(4000, 3000, ImageFormat.RAW_SENSOR, 1)
-                    }
-                },
+                onCameraReady = { c, pv -> camera = c; previewViewRef = pv },
                 onTap = { x, y -> onTapToFocus(x, y) },
                 onZoom = { onZoom(it) },
                 onShutter = {
-                    when (selectedMode) {
-                        0 -> { if (isRecording) stopRecording() else startRecording() }
-                        else -> takePhoto()
-                    }
+                    when (selectedMode) { 0 -> { if (isRecording) stopRecording() else startRecording() }; else -> takePhoto() }
                 },
                 onFlashToggle = { toggleFlash() },
                 onSwitchCamera = { switchCamera() },
@@ -482,64 +630,16 @@ fun CameraScreen() {
     }
 }
 
-// ── RAW DNG 捕获 ────────────────────────────────────────────────────
-
-/**
- * 从 ImageReader 读取 RAW_SENSOR 数据并转为 DNG 字节
- * 使用 Camera2 API 直接捕获，不经过 CameraX
- */
-private fun captureRawDng(context: Context, reader: ImageReader?): ByteArray? {
-    val imageReader = reader ?: return null
-
-    return try {
-        val manager = context.getSystemService(Context.CAMERA_SERVICE) as android.hardware.camera2.CameraManager
-        val cameraId = "0" // 后置摄像头
-
-        // 等待 RAW 帧
-        val image = imageReader.acquireLatestImage() ?: return null
-
-        try {
-            val dngFile = File(context.cacheDir, "raw_${System.currentTimeMillis()}.dng")
-            val dngCreator = android.hardware.camera2.DngCreator(
-                manager.getCameraCharacteristics(cameraId),
-                android.hardware.camera2.CaptureResult() // 简化：用空 result
-            )
-
-            // 获取 RAW Plane
-            val plane = image.planes[0]
-            val buffer = plane.buffer
-            val bytes = ByteArray(buffer.remaining())
-            buffer.get(bytes)
-
-            // 写 DNG (简化版 - 实际需要完整的 CaptureResult)
-            // 这里返回 RAW 字节，由 PhotoSaver 处理
-            dngCreator.close()
-            image.close()
-
-            // 注意: 完整 DNG 写入需要 CaptureResult 中的传感器参数
-            // 简化实现：保存 RAW_SENSOR 原始数据
-            bytes
-        } finally {
-            image.close()
-        }
-    } catch (_: Exception) {
-        null
-    }
-}
-
 // ── Permission ───────────────────────────────────────────────────────
 
 @Composable
 private fun PermissionScreen(onRequest: () -> Unit) {
     Column(Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
         Text("Camera access required", color = TextPrimary, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
-        Spacer(Modifier.height(8.dp))
-        Text("Grant permission to start taking photos", color = TextMuted, fontSize = 13.sp)
+        Spacer(Modifier.height(8.dp)); Text("Grant permission to start taking photos", color = TextMuted, fontSize = 13.sp)
         Spacer(Modifier.height(16.dp))
-        Button(onRequest, colors = ButtonDefaults.buttonColors(containerColor = TextPrimary),
-            shape = RoundedCornerShape(20.dp), contentPadding = PaddingValues(horizontal = 24.dp, vertical = 10.dp)) {
-            Text("Allow", color = Bg, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
-        }
+        Button(onRequest, colors = ButtonDefaults.buttonColors(containerColor = TextPrimary), shape = RoundedCornerShape(20.dp),
+            contentPadding = PaddingValues(horizontal = 24.dp, vertical = 10.dp)) { Text("Allow", color = Bg, fontSize = 14.sp, fontWeight = FontWeight.SemiBold) }
     }
 }
 
@@ -547,45 +647,24 @@ private fun PermissionScreen(onRequest: () -> Unit) {
 
 @Composable
 private fun ViewfinderScreen(
-    imageCapture: ImageCapture,
-    videoCapture: VideoCapture<Recorder>,
-    isFrontCamera: Boolean,
-    zoomRatio: Float,
-    showGrid: Boolean,
-    showFocusRing: Boolean,
-    focusPoint: Offset?,
-    showFlash: Boolean,
-    flashMode: Int,
-    selectedMode: Int,
-    lastPhotoBitmap: Bitmap?,
-    isRecording: Boolean,
-    recordingDuration: Int,
-    showExposureSlider: Boolean,
-    exposureComp: Float,
-    enableLocation: Boolean,
-    enableRaw: Boolean,
-    isRawSupported: Boolean,
+    imageCapture: ImageCapture, videoCapture: VideoCapture<Recorder>,
+    isFrontCamera: Boolean, zoomRatio: Float, showGrid: Boolean,
+    showFocusRing: Boolean, focusPoint: Offset?, showFlash: Boolean, flashMode: Int,
+    selectedMode: Int, lastPhotoBitmap: Bitmap?,
+    isRecording: Boolean, recordingDuration: Int,
+    showExposureSlider: Boolean, exposureComp: Float,
+    enableLocation: Boolean, enableRaw: Boolean, isRawSupported: Boolean,
     onCameraReady: (Camera, PreviewView) -> Unit,
-    onTap: (Float, Float) -> Unit,
-    onZoom: (Float) -> Unit,
-    onShutter: () -> Unit,
-    onFlashToggle: () -> Unit,
-    onSwitchCamera: () -> Unit,
-    onModeChange: (Int) -> Unit,
-    onGridToggle: () -> Unit,
-    onGalleryClick: () -> Unit,
-    onExposureToggle: () -> Unit,
-    onExposureChange: (Float) -> Unit,
-    onLocationToggle: () -> Unit,
-    onRawToggle: () -> Unit
+    onTap: (Float, Float) -> Unit, onZoom: (Float) -> Unit, onShutter: () -> Unit,
+    onFlashToggle: () -> Unit, onSwitchCamera: () -> Unit, onModeChange: (Int) -> Unit,
+    onGridToggle: () -> Unit, onGalleryClick: () -> Unit,
+    onExposureToggle: () -> Unit, onExposureChange: (Float) -> Unit,
+    onLocationToggle: () -> Unit, onRawToggle: () -> Unit
 ) {
     Box(Modifier.fillMaxSize()) {
-        Box(Modifier.fillMaxSize().pointerInput(Unit) {
-            detectTransformGestures { _, _, zoom, _ -> if (zoom != 1f) onZoom(zoom) }
-        }) {
+        Box(Modifier.fillMaxSize().pointerInput(Unit) { detectTransformGestures { _, _, zoom, _ -> if (zoom != 1f) onZoom(zoom) } }) {
             CameraPreviewWithFocus(imageCapture, videoCapture, isFrontCamera, showGrid, showFocusRing, focusPoint,
-                onTap, onCameraReady,
-                Modifier.fillMaxWidth().aspectRatio(3f / 4f).align(Alignment.Center))
+                onTap, onCameraReady, Modifier.fillMaxWidth().aspectRatio(3f / 4f).align(Alignment.Center))
         }
 
         if (showFlash) Box(Modifier.fillMaxSize().background(Color.White.copy(alpha = 0.7f)))
@@ -595,20 +674,13 @@ private fun ViewfinderScreen(
             Modifier.align(Alignment.TopStart).statusBarsPadding().padding(horizontal = 16.dp, vertical = 8.dp))
 
         if (zoomRatio > 1.05f) {
-            Text("${String.format("%.1f", zoomRatio)}x", color = TextPrimary, fontSize = 13.sp,
-                fontWeight = FontWeight.SemiBold,
+            Text("${String.format("%.1f", zoomRatio)}x", color = TextPrimary, fontSize = 13.sp, fontWeight = FontWeight.SemiBold,
                 modifier = Modifier.align(Alignment.TopCenter).statusBarsPadding().padding(top = 64.dp)
-                    .background(Surface2.copy(alpha = 0.6f), RoundedCornerShape(10.dp))
-                    .padding(horizontal = 10.dp, vertical = 4.dp))
+                    .background(Surface2.copy(alpha = 0.6f), RoundedCornerShape(10.dp)).padding(horizontal = 10.dp, vertical = 4.dp))
         }
 
-        if (showExposureSlider) {
-            ExposureSlider(exposureComp, onExposureChange, Modifier.align(Alignment.CenterEnd).padding(end = 16.dp))
-        }
-
-        if (isRecording) {
-            RecordingIndicator(recordingDuration, Modifier.align(Alignment.TopCenter).statusBarsPadding().padding(top = 12.dp))
-        }
+        if (showExposureSlider) ExposureSlider(exposureComp, onExposureChange, Modifier.align(Alignment.CenterEnd).padding(end = 16.dp))
+        if (isRecording) RecordingIndicator(recordingDuration, Modifier.align(Alignment.TopCenter).statusBarsPadding().padding(top = 12.dp))
 
         if (enableLocation) {
             Row(Modifier.align(Alignment.TopEnd).statusBarsPadding().padding(top = 56.dp, end = 16.dp)
@@ -638,119 +710,72 @@ private fun ViewfinderScreen(
 
 @Composable
 private fun CameraPreviewWithFocus(
-    imageCapture: ImageCapture,
-    videoCapture: VideoCapture<Recorder>,
-    isFrontCamera: Boolean,
-    showGrid: Boolean,
-    showFocusRing: Boolean,
-    focusPoint: Offset?,
-    onTap: (Float, Float) -> Unit,
-    onCameraReady: (Camera, PreviewView) -> Unit,
-    modifier: Modifier = Modifier
+    imageCapture: ImageCapture, videoCapture: VideoCapture<Recorder>,
+    isFrontCamera: Boolean, showGrid: Boolean, showFocusRing: Boolean, focusPoint: Offset?,
+    onTap: (Float, Float) -> Unit, onCameraReady: (Camera, PreviewView) -> Unit, modifier: Modifier = Modifier
 ) {
-    val context = LocalContext.current
-    val lifecycleOwner = LocalLifecycleOwner.current
-
+    val context = LocalContext.current; val lifecycleOwner = LocalLifecycleOwner.current
     Box(modifier.clip(RoundedCornerShape(4.dp))) {
         AndroidView(
-            factory = { ctx ->
-                PreviewView(ctx).apply {
-                    scaleType = PreviewView.ScaleType.FIT_CENTER
-                    implementationMode = PreviewView.ImplementationMode.COMPATIBLE
-                    setOnTouchListener { _, event ->
-                        if (event.action == MotionEvent.ACTION_UP) onTap(event.x, event.y)
-                        true
-                    }
-                }
-            },
+            factory = { ctx -> PreviewView(ctx).apply {
+                scaleType = PreviewView.ScaleType.FIT_CENTER; implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+                setOnTouchListener { _, event -> if (event.action == MotionEvent.ACTION_UP) onTap(event.x, event.y); true }
+            } },
             update = { pv ->
                 val future = ProcessCameraProvider.getInstance(context)
                 future.addListener({
                     val provider = future.get()
-                    val preview = Preview.Builder().setTargetAspectRatio(AspectRatio.RATIO_4_3).build()
-                        .also { it.surfaceProvider = pv.surfaceProvider }
+                    val preview = Preview.Builder().setTargetAspectRatio(AspectRatio.RATIO_4_3).build().also { it.surfaceProvider = pv.surfaceProvider }
                     val selector = if (isFrontCamera) CameraSelector.DEFAULT_FRONT_CAMERA else CameraSelector.DEFAULT_BACK_CAMERA
                     try {
                         provider.unbindAll()
-                        val useCaseGroup = UseCaseGroup.Builder()
-                            .addUseCase(preview)
-                            .addUseCase(imageCapture)
-                            .addUseCase(videoCapture)
-                            .setViewPort(pv.viewPort!!)
-                            .build()
+                        val useCaseGroup = UseCaseGroup.Builder().addUseCase(preview).addUseCase(imageCapture).addUseCase(videoCapture).setViewPort(pv.viewPort!!).build()
                         val cam = provider.bindToLifecycle(lifecycleOwner, selector, useCaseGroup)
                         onCameraReady(cam, pv)
                     } catch (_: Exception) {}
                 }, ContextCompat.getMainExecutor(context))
-            },
-            modifier = Modifier.fillMaxSize()
+            }, modifier = Modifier.fillMaxSize()
         )
-
         if (showGrid) GridOverlay(Modifier.fillMaxSize())
         if (showFocusRing && focusPoint != null) FocusRing(focusPoint)
     }
 }
 
-// ── Grid ─────────────────────────────────────────────────────────────
+// ── UI Components ────────────────────────────────────────────────────
 
-@Composable
-private fun GridOverlay(modifier: Modifier) {
-    Canvas(modifier) {
-        val w = size.width; val h = size.height
-        drawLine(GridColor, Offset(w / 3, 0f), Offset(w / 3, h), strokeWidth = 1f)
-        drawLine(GridColor, Offset(w * 2 / 3, 0f), Offset(w * 2 / 3, h), strokeWidth = 1f)
-        drawLine(GridColor, Offset(0f, h / 3), Offset(w, h / 3), strokeWidth = 1f)
-        drawLine(GridColor, Offset(0f, h * 2 / 3), Offset(w, h * 2 / 3), strokeWidth = 1f)
+@Composable private fun GridOverlay(modifier: Modifier) {
+    Canvas(modifier) { val w = size.width; val h = size.height
+        drawLine(GridColor, Offset(w/3, 0f), Offset(w/3, h), strokeWidth = 1f)
+        drawLine(GridColor, Offset(w*2/3, 0f), Offset(w*2/3, h), strokeWidth = 1f)
+        drawLine(GridColor, Offset(0f, h/3), Offset(w, h/3), strokeWidth = 1f)
+        drawLine(GridColor, Offset(0f, h*2/3), Offset(w, h*2/3), strokeWidth = 1f)
     }
 }
 
-// ── Focus Ring ───────────────────────────────────────────────────────
-
-@Composable
-private fun FocusRing(point: Offset) {
+@Composable private fun FocusRing(point: Offset) {
     val alpha by animateFloatAsState(targetValue = 0f, animationSpec = tween(1200), label = "focus")
-    Canvas(Modifier.fillMaxSize()) {
-        drawCircle(color = TextPrimary.copy(alpha = 0.8f), radius = 40f, center = point, style = Stroke(2f))
-    }
+    Canvas(Modifier.fillMaxSize()) { drawCircle(color = TextPrimary.copy(alpha = 0.8f), radius = 40f, center = point, style = Stroke(2f)) }
 }
 
-// ── Exposure Slider ──────────────────────────────────────────────────
-
-@Composable
-private fun ExposureSlider(value: Float, onChange: (Float) -> Unit, modifier: Modifier) {
+@Composable private fun ExposureSlider(value: Float, onChange: (Float) -> Unit, modifier: Modifier) {
     Column(modifier.width(36.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-        Icon(Icons.Default.Brightness6, null, tint = TextPrimary, modifier = Modifier.size(16.dp))
-        Spacer(Modifier.height(8.dp))
+        Icon(Icons.Default.Brightness6, null, tint = TextPrimary, modifier = Modifier.size(16.dp)); Spacer(Modifier.height(8.dp))
         Slider(value = value, onValueChange = onChange, valueRange = -1f..1f, modifier = Modifier.height(200.dp),
             colors = SliderDefaults.colors(thumbColor = TextPrimary, activeTrackColor = TextPrimary, inactiveTrackColor = AccentDim))
     }
 }
 
-// ── Recording Indicator ──────────────────────────────────────────────
-
-@Composable
-private fun RecordingIndicator(duration: Int, modifier: Modifier) {
-    val min = duration / 60; val sec = duration % 60
+@Composable private fun RecordingIndicator(duration: Int, modifier: Modifier) {
     Row(modifier.background(Surface.copy(alpha = 0.8f), RoundedCornerShape(14.dp)).padding(horizontal = 12.dp, vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         Box(Modifier.size(8.dp).background(Danger, CircleShape))
-        Text("%d:%02d".format(min, sec), color = TextPrimary, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+        Text("%d:%02d".format(duration / 60, duration % 60), color = TextPrimary, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
     }
 }
 
-// ── TopBar ───────────────────────────────────────────────────────────
-
-@Composable
-private fun TopBar(
-    flashMode: Int, showGrid: Boolean, enableLocation: Boolean, enableRaw: Boolean, isRawSupported: Boolean,
-    onFlashToggle: () -> Unit, onGridToggle: () -> Unit, onExposureToggle: () -> Unit,
-    onLocationToggle: () -> Unit, onRawToggle: () -> Unit, modifier: Modifier
-) {
-    val flashIcon = when (flashMode) {
-        ImageCapture.FLASH_MODE_ON -> Icons.Default.FlashOn
-        ImageCapture.FLASH_MODE_OFF -> Icons.Default.FlashOff
-        else -> Icons.Default.FlashAuto
-    }
+@Composable private fun TopBar(flashMode: Int, showGrid: Boolean, enableLocation: Boolean, enableRaw: Boolean, isRawSupported: Boolean,
+    onFlashToggle: () -> Unit, onGridToggle: () -> Unit, onExposureToggle: () -> Unit, onLocationToggle: () -> Unit, onRawToggle: () -> Unit, modifier: Modifier) {
+    val flashIcon = when (flashMode) { ImageCapture.FLASH_MODE_ON -> Icons.Default.FlashOn; ImageCapture.FLASH_MODE_OFF -> Icons.Default.FlashOff; else -> Icons.Default.FlashAuto }
     Row(modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
         CircleIconButton(flashIcon, if (flashMode == ImageCapture.FLASH_MODE_OFF) AccentDim else TextMuted, onClick = onFlashToggle)
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -759,8 +784,7 @@ private fun TopBar(
             CircleIconButton(Icons.Default.LocationOn, if (enableLocation) TextPrimary else TextMuted, onClick = onLocationToggle)
             if (isRawSupported) {
                 Box(Modifier.size(36.dp).background(Surface2.copy(alpha = 0.6f), CircleShape)
-                    .clickable(remember { MutableInteractionSource() }, null) { onRawToggle() },
-                    contentAlignment = Alignment.Center) {
+                    .clickable(remember { MutableInteractionSource() }, null) { onRawToggle() }, contentAlignment = Alignment.Center) {
                     Text("R", color = if (enableRaw) TextPrimary else TextMuted, fontSize = 11.sp, fontWeight = FontWeight.Bold)
                 }
             }
@@ -768,29 +792,20 @@ private fun TopBar(
     }
 }
 
-// ── Bottom Controls ──────────────────────────────────────────────────
-
-@Composable
-private fun BottomControls(selectedMode: Int, lastPhotoBitmap: Bitmap?, isRecording: Boolean,
+@Composable private fun BottomControls(selectedMode: Int, lastPhotoBitmap: Bitmap?, isRecording: Boolean,
     onModeChange: (Int) -> Unit, onShutter: () -> Unit, onSwitchCamera: () -> Unit, onGalleryClick: () -> Unit, modifier: Modifier) {
     val modes = listOf("Video", "Photo", "Portrait")
     Column(modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
         Row(horizontalArrangement = Arrangement.spacedBy(20.dp), verticalAlignment = Alignment.CenterVertically) {
-            modes.forEachIndexed { i, label ->
-                Text(label.uppercase(), color = if (i == selectedMode) TextPrimary else TextMuted,
-                    fontSize = 12.sp, fontWeight = FontWeight.Medium, letterSpacing = 0.3.sp,
-                    modifier = Modifier.clickable(remember { MutableInteractionSource() }, null) { onModeChange(i) })
-            }
+            modes.forEachIndexed { i, label -> Text(label.uppercase(), color = if (i == selectedMode) TextPrimary else TextMuted,
+                fontSize = 12.sp, fontWeight = FontWeight.Medium, letterSpacing = 0.3.sp,
+                modifier = Modifier.clickable(remember { MutableInteractionSource() }, null) { onModeChange(i) }) }
         }
         Spacer(Modifier.height(20.dp))
-        Row(Modifier.fillMaxWidth().padding(horizontal = 32.dp),
-            horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-            Box(Modifier.size(42.dp).background(Surface2, RoundedCornerShape(8.dp))
-                .clickable(remember { MutableInteractionSource() }, null) { onGalleryClick() },
-                contentAlignment = Alignment.Center) {
-                if (lastPhotoBitmap != null) {
-                    Image(lastPhotoBitmap.asImageBitmap(), null, Modifier.size(42.dp).clip(RoundedCornerShape(8.dp)), contentScale = ContentScale.Crop)
-                } else { Icon(Icons.Default.GridOn, null, tint = TextMuted, modifier = Modifier.size(20.dp)) }
+        Row(Modifier.fillMaxWidth().padding(horizontal = 32.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+            Box(Modifier.size(42.dp).background(Surface2, RoundedCornerShape(8.dp)).clickable(remember { MutableInteractionSource() }, null) { onGalleryClick() }, contentAlignment = Alignment.Center) {
+                if (lastPhotoBitmap != null) Image(lastPhotoBitmap.asImageBitmap(), null, Modifier.size(42.dp).clip(RoundedCornerShape(8.dp)), contentScale = ContentScale.Crop)
+                else Icon(Icons.Default.GridOn, null, tint = TextMuted, modifier = Modifier.size(20.dp))
             }
             if (selectedMode == 0) {
                 Box(Modifier.size(72.dp).border(3.dp, if (isRecording) Danger else TextPrimary, CircleShape)
@@ -799,8 +814,7 @@ private fun BottomControls(selectedMode: Int, lastPhotoBitmap: Bitmap?, isRecord
                     else Box(Modifier.size(60.dp).background(Danger, CircleShape))
                 }
             } else {
-                Box(Modifier.size(72.dp).border(3.dp, TextPrimary, CircleShape)
-                    .clickable(remember { MutableInteractionSource() }, null) { onShutter() }, contentAlignment = Alignment.Center) {
+                Box(Modifier.size(72.dp).border(3.dp, TextPrimary, CircleShape).clickable(remember { MutableInteractionSource() }, null) { onShutter() }, contentAlignment = Alignment.Center) {
                     Box(Modifier.size(60.dp).background(TextPrimary, CircleShape))
                 }
             }
@@ -809,60 +823,43 @@ private fun BottomControls(selectedMode: Int, lastPhotoBitmap: Bitmap?, isRecord
     }
 }
 
-// ── Review ───────────────────────────────────────────────────────────
-
-@Composable
-private fun ReviewScreen(processedBytes: ByteArray?, isProcessing: Boolean, selectedFilter: FilterType,
+@Composable private fun ReviewScreen(processedBytes: ByteArray?, isProcessing: Boolean, selectedFilter: FilterType,
     onSelectFilter: (FilterType) -> Unit, onRetake: () -> Unit, onSave: () -> Unit) {
     Box(Modifier.fillMaxSize()) {
         val bitmap = remember(processedBytes) { processedBytes?.let { BitmapFactory.decodeByteArray(it, 0, it.size) } }
         bitmap?.let { Image(it.asImageBitmap(), null, Modifier.fillMaxSize(), contentScale = ContentScale.Fit) }
         if (isProcessing) ProcessingBadge(Modifier.align(Alignment.TopCenter).statusBarsPadding().padding(top = 12.dp))
-        ReviewControls(selectedFilter, onSelectFilter, onRetake, onSave,
-            Modifier.align(Alignment.BottomStart).navigationBarsPadding().padding(bottom = 24.dp))
+        ReviewControls(selectedFilter, onSelectFilter, onRetake, onSave, Modifier.align(Alignment.BottomStart).navigationBarsPadding().padding(bottom = 24.dp))
     }
 }
 
-// ── Components ───────────────────────────────────────────────────────
-
-@Composable
-private fun CircleIconButton(icon: ImageVector, tint: Color, size: Int = 36, onClick: () -> Unit) {
-    Box(Modifier.size(size.dp).background(Surface2.copy(alpha = 0.6f), CircleShape)
-        .clickable(remember { MutableInteractionSource() }, null) { onClick() }, contentAlignment = Alignment.Center) {
+@Composable private fun CircleIconButton(icon: ImageVector, tint: Color, size: Int = 36, onClick: () -> Unit) {
+    Box(Modifier.size(size.dp).background(Surface2.copy(alpha = 0.6f), CircleShape).clickable(remember { MutableInteractionSource() }, null) { onClick() }, contentAlignment = Alignment.Center) {
         Icon(icon, null, tint = tint, modifier = Modifier.size((size * 0.5).dp))
     }
 }
 
-@Composable
-private fun ProcessingBadge(modifier: Modifier) {
-    Row(modifier.background(Surface.copy(alpha = 0.7f), RoundedCornerShape(14.dp)).padding(horizontal = 14.dp, vertical = 6.dp),
-        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+@Composable private fun ProcessingBadge(modifier: Modifier) {
+    Row(modifier.background(Surface.copy(alpha = 0.7f), RoundedCornerShape(14.dp)).padding(horizontal = 14.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
         CircularProgressIndicator(Modifier.size(12.dp), color = TextMuted, strokeWidth = 1.5.dp)
         Text("Processing", color = TextMuted, fontSize = 12.sp, fontWeight = FontWeight.Medium)
     }
 }
 
-@Composable
-private fun ReviewControls(selectedFilter: FilterType, onSelectFilter: (FilterType) -> Unit,
-    onRetake: () -> Unit, onSave: () -> Unit, modifier: Modifier) {
+@Composable private fun ReviewControls(selectedFilter: FilterType, onSelectFilter: (FilterType) -> Unit, onRetake: () -> Unit, onSave: () -> Unit, modifier: Modifier) {
     Column(modifier.fillMaxWidth()) {
         LazyRow(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp), contentPadding = PaddingValues(horizontal = 20.dp)) {
-            items(RustBridge.supportedFilters()) { filter ->
-                val active = selectedFilter == filter
-                Text(RustBridge.filterName(filter), color = if (active) Bg else TextMuted, fontSize = 12.sp, fontWeight = FontWeight.Medium,
-                    letterSpacing = 0.2.sp, modifier = Modifier.clip(RoundedCornerShape(14.dp))
-                        .background(if (active) TextPrimary else Color.Transparent)
+            items(RustBridge.supportedFilters()) { filter -> val active = selectedFilter == filter
+                Text(RustBridge.filterName(filter), color = if (active) Bg else TextMuted, fontSize = 12.sp, fontWeight = FontWeight.Medium, letterSpacing = 0.2.sp,
+                    modifier = Modifier.clip(RoundedCornerShape(14.dp)).background(if (active) TextPrimary else Color.Transparent)
                         .then(if (!active) Modifier.border(1.5.dp, AccentDim, RoundedCornerShape(14.dp)) else Modifier)
-                        .clickable(remember { MutableInteractionSource() }, null) { onSelectFilter(filter) }
-                        .padding(horizontal = 14.dp, vertical = 6.dp))
+                        .clickable(remember { MutableInteractionSource() }, null) { onSelectFilter(filter) }.padding(horizontal = 14.dp, vertical = 6.dp))
             }
         }
         Spacer(Modifier.height(12.dp))
         Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-            TextButton(onRetake, colors = ButtonDefaults.textButtonColors(contentColor = TextPrimary), shape = RoundedCornerShape(20.dp),
-                contentPadding = PaddingValues(horizontal = 24.dp, vertical = 10.dp)) { Text("Retake", fontSize = 14.sp, fontWeight = FontWeight.Medium) }
-            Button(onSave, colors = ButtonDefaults.buttonColors(containerColor = TextPrimary), shape = RoundedCornerShape(20.dp),
-                contentPadding = PaddingValues(horizontal = 28.dp, vertical = 10.dp)) { Text("Save", color = Bg, fontSize = 14.sp, fontWeight = FontWeight.SemiBold) }
+            TextButton(onRetake, colors = ButtonDefaults.textButtonColors(contentColor = TextPrimary), shape = RoundedCornerShape(20.dp), contentPadding = PaddingValues(horizontal = 24.dp, vertical = 10.dp)) { Text("Retake", fontSize = 14.sp, fontWeight = FontWeight.Medium) }
+            Button(onSave, colors = ButtonDefaults.buttonColors(containerColor = TextPrimary), shape = RoundedCornerShape(20.dp), contentPadding = PaddingValues(horizontal = 28.dp, vertical = 10.dp)) { Text("Save", color = Bg, fontSize = 14.sp, fontWeight = FontWeight.SemiBold) }
         }
     }
 }
@@ -889,23 +886,12 @@ private fun imageProxyToJpegBytes(image: ImageProxy): ByteArray {
 private fun rotateJpeg(bytes: ByteArray, degrees: Int): ByteArray {
     val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return bytes
     val rotated = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, Matrix().apply { postRotate(degrees.toFloat()) }, true)
-    bmp.recycle()
-    val out = ByteArrayOutputStream(); rotated.compress(Bitmap.CompressFormat.JPEG, 95, out); rotated.recycle()
-    return out.toByteArray()
+    bmp.recycle(); val out = ByteArrayOutputStream(); rotated.compress(Bitmap.CompressFormat.JPEG, 95, out); rotated.recycle(); return out.toByteArray()
 }
 
-// ── Last photo thumbnail ─────────────────────────────────────────────
-
 private fun loadLastPhotoThumbnail(ctx: Context): Bitmap? {
-    val uri = ctx.contentResolver.query(
-        MediaStore.Images.Media.EXTERNAL_CONTENT_URI, arrayOf(MediaStore.Images.Media._ID),
-        "${MediaStore.Images.Media.RELATIVE_PATH} LIKE ?", arrayOf("%Pictures/CameraApp%"),
-        "${MediaStore.Images.Media.DATE_ADDED} DESC"
-    )?.use { c ->
-        if (c.moveToFirst()) {
-            val id = c.getLong(c.getColumnIndexOrThrow(MediaStore.Images.Media._ID))
-            ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id)
-        } else null
-    }
+    val uri = ctx.contentResolver.query(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, arrayOf(MediaStore.Images.Media._ID),
+        "${MediaStore.Images.Media.RELATIVE_PATH} LIKE ?", arrayOf("%Pictures/CameraApp%"), "${MediaStore.Images.Media.DATE_ADDED} DESC"
+    )?.use { c -> if (c.moveToFirst()) { val id = c.getLong(c.getColumnIndexOrThrow(MediaStore.Images.Media._ID)); ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id) } else null }
     return uri?.let { try { ctx.contentResolver.loadThumbnail(it, android.util.Size(128, 128), null) } catch (_: Exception) { null } }
 }
