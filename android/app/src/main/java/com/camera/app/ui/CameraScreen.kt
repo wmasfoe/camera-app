@@ -11,8 +11,6 @@ import android.graphics.ImageFormat
 import android.graphics.Matrix
 import android.graphics.Rect
 import android.graphics.YuvImage
-import android.hardware.camera2.CameraCharacteristics
-import android.hardware.camera2.CameraMetadata
 import android.location.Location
 import android.os.VibrationEffect
 import android.os.Vibrator
@@ -25,7 +23,6 @@ import androidx.camera.core.AspectRatio
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraInfo
 import androidx.camera.core.CameraSelector
-import androidx.camera.core.DynamicRange
 import androidx.camera.core.FocusMeteringAction
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
@@ -230,19 +227,9 @@ fun CameraScreen() {
         }
     }
 
-    // 检测 RAW 支持 (通过 Camera2 API)
-    LaunchedEffect(camera) {
-        camera?.cameraInfo?.let { info ->
-            isRawSupported = try {
-                val cameraId = info.cameraId
-                val manager = context.getSystemService(Context.CAMERA_SERVICE) as android.hardware.camera2.CameraManager
-                val chars = manager.getCameraCharacteristics(cameraId)
-                val capabilities = chars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
-                capabilities?.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_RAW) == true
-            } catch (_: Exception) {
-                false
-            }
-        }
+    // RAW 支持默认开启（设备不支持时静默降级）
+    LaunchedEffect(Unit) {
+        isRawSupported = true
     }
 
     // Focus ring disappear
