@@ -10,28 +10,12 @@ import android.graphics.BitmapFactory
 import android.graphics.ImageFormat
 import android.graphics.Matrix
 import android.graphics.Rect
-import android.graphics.SurfaceTexture
 import android.graphics.YuvImage
-import android.hardware.camera2.CameraCaptureSession
-import android.hardware.camera2.CameraCharacteristics
-import android.hardware.camera2.CameraDevice
-import android.hardware.camera2.CameraManager
-import android.hardware.camera2.CameraMetadata
-import android.hardware.camera2.CaptureRequest
-import android.hardware.camera2.TotalCaptureResult
-import android.hardware.camera2.params.OutputConfiguration
-import android.hardware.camera2.params.SessionConfiguration
-import android.hardware.camera2.DngCreator
 import android.location.Location
-import android.media.ImageReader
-import android.os.Handler
-import android.os.HandlerThread
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.provider.MediaStore
-import android.util.Size
 import android.view.MotionEvent
-import android.view.Surface
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -95,6 +79,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import com.camera.app.bridge.PhotoSaver
 import com.camera.app.bridge.RustBridge
+import com.camera.app.capture.RawCaptureEngine
 import com.google.android.gms.location.LocationServices
 import com.google.android.gms.location.Priority
 import com.google.android.gms.tasks.CancellationTokenSource
@@ -106,13 +91,11 @@ import kotlinx.coroutines.withContext
 import uniffi.camera_shared_core.FilterType
 import java.io.ByteArrayOutputStream
 import java.io.File
-import java.nio.ByteBuffer
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicReference
 import kotlin.coroutines.resume
 
 // ── Tokens ───────────────────────────────────────────────────────────
@@ -126,179 +109,12 @@ private val AccentDim = Color(0xFF636366)
 private val GridColor = Color(0x33FFFFFF)
 private val Danger = Color(0xFFFF453A)
 
-// ── RAW 支持检测 ────────────────────────────────────────────────────
-
-private fun isRawSupported(context: Context, facingFront: Boolean): Boolean {
-    return try {
-        val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
-        val cameraId = findCameraId(manager, facingFront) ?: return false
-        val chars = manager.getCameraCharacteristics(cameraId)
-        val caps = chars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
-        caps?.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_RAW) == true
-    } catch (_: Exception) { false }
-}
-
-private fun findCameraId(manager: CameraManager, facingFront: Boolean): String? {
-    for (id in manager.cameraIdList) {
-        val chars = manager.getCameraCharacteristics(id)
-        val facing = chars.get(CameraCharacteristics.LENS_FACING)
-        if (facingFront && facing == CameraCharacteristics.LENS_FACING_FRONT) return id
-        if (!facingFront && facing == CameraCharacteristics.LENS_FACING_BACK) return id
-    }
-    return null
-}
-
-// ── RAW + JPEG 同时捕获 (Camera2 API) ───────────────────────────────
-
-/**
- * 使用 Camera2 API 同时捕获 JPEG + RAW_SENSOR
- * 返回 Pair(jpegBytes, dngBytes)
- *
- * 完整流程:
- * 1. 暂停 CameraX 预览
- * 2. 打开 Camera2 设备
- * 3. 创建同时输出 JPEG + RAW_SENSOR 的捕获会话
- * 4. 捕获一帧，获取 TotalCaptureResult
- * 5. 用 DngCreator + CaptureResult 写入完整 DNG
- * 6. 恢复 CameraX 预览
- */
-private suspend fun captureJpegAndRaw(
-    context: Context,
-    facingFront: Boolean,
-    flashMode: Int,
-    orientation: Int
-): Pair<ByteArray, ByteArray>? = withContext(Dispatchers.IO) {
-    val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
-    val cameraId = findCameraId(manager, facingFront) ?: return@withContext null
-
-    val chars = manager.getCameraCharacteristics(cameraId)
-    val sizes = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-        ?: return@withContext null
-
-    // 选择最大的 JPEG 和 RAW 尺寸
-    val jpegSize = sizes.getOutputSizes(ImageFormat.JPEG).maxByOrNull { it.width * it.height }
-        ?: return@withContext null
-    val rawSize = sizes.getOutputSizes(ImageFormat.RAW_SENSOR).maxByOrNull { it.width * it.height }
-        ?: return@withContext null
-
-    // 创建 ImageReader
-    val jpegReader = ImageReader.newInstance(jpegSize.width, jpegSize.height, ImageFormat.JPEG, 1)
-    val rawReader = ImageReader.newInstance(rawSize.width, rawSize.height, ImageFormat.RAW_SENSOR, 1)
-
-    // Camera2 Handler
-    val handlerThread = HandlerThread("Camera2RawCapture").apply { start() }
-    val handler = Handler(handlerThread.looper)
-
-    // 结果存储
-    val jpegResult = AtomicReference<ByteArray?>(null)
-    val rawResult = AtomicReference<ByteArray?>(null)
-    val captureResultRef = AtomicReference<TotalCaptureResult?>(null)
-
-    try {
-        // 打开相机
-        val device = suspendCancellableCoroutine<CameraDevice> { cont ->
-            manager.openCamera(cameraId, object : CameraDevice.StateCallback() {
-                override fun onOpened(camera: CameraDevice) { cont.resume(camera) }
-                override fun onDisconnected(camera: CameraDevice) { camera.close() }
-                override fun onError(camera: CameraDevice, error: Int) { camera.close() }
-            }, handler)
-        }
-
-        try {
-            // 创建捕获会话 (JPEG + RAW 双输出)
-            val jpegSurface = jpegReader.surface
-            val rawSurface = rawReader.surface
-
-            val session = suspendCancellableCoroutine<CameraCaptureSession> { cont ->
-                val outputs = listOf(
-                    OutputConfiguration(jpegSurface),
-                    OutputConfiguration(rawSurface)
-                )
-                val sessionConfig = SessionConfiguration(
-                    SessionConfiguration.SESSION_REGULAR,
-                    outputs,
-                    context.mainExecutor,
-                    object : CameraCaptureSession.StateCallback() {
-                        override fun onConfigured(s: CameraCaptureSession) { cont.resume(s) }
-                        override fun onConfigureFailed(s: CameraCaptureSession) {}
-                    }
-                )
-                device.createCaptureSession(sessionConfig)
-            }
-
-            // 构建捕获请求
-            val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
-            builder.addTarget(jpegSurface)
-            builder.addTarget(rawSurface)
-
-            // 设置参数
-            builder.set(CaptureRequest.JPEG_QUALITY, 95.toByte())
-            builder.set(CaptureRequest.JPEG_ORIENTATION, orientation)
-
-            // 闪光灯
-            when (flashMode) {
-                ImageCapture.FLASH_MODE_ON -> builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
-                ImageCapture.FLASH_MODE_AUTO -> builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON_AUTO_FLASH)
-                else -> builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
-            }
-
-            // RAW: 关闭所有后处理，获取最原始数据
-            builder.set(CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE, CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE_ON)
-            builder.set(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY)
-
-            // 捕获
-            val captureResult = suspendCancellableCoroutine<TotalCaptureResult> { cont ->
-                session.capture(builder.build(), object : CameraCaptureSession.CaptureCallback() {
-                    override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
-                        cont.resume(result)
-                    }
-                }, handler)
-            }
-            captureResultRef.set(captureResult)
-
-            // 读取 JPEG
-            val jpegImage = jpegReader.acquireLatestImage()
-            if (jpegImage != null) {
-                val buf = jpegImage.planes[0].buffer
-                jpegResult.set(ByteArray(buf.remaining()).also { buf.get(it) })
-                jpegImage.close()
-            }
-
-            // 读取 RAW + 写入 DNG
-            val rawImage = rawReader.acquireLatestImage()
-            if (rawImage != null) {
-                val dngFile = File(context.cacheDir, "raw_${System.currentTimeMillis()}.dng")
-                try {
-                    val dngCreator = DngCreator(chars, captureResult)
-                    dngCreator.setOrientation(orientation)
-                    dngCreator.writeImage(File(dngFile.absolutePath).outputStream(), rawImage)
-                    dngCreator.close()
-                    rawResult.set(dngFile.readBytes())
-                } finally {
-                    rawImage.close()
-                    dngFile.delete()
-                }
-            }
-
-        } finally {
-            device.close()
-        }
-    } finally {
-        jpegReader.close()
-        rawReader.close()
-        handlerThread.quitSafely()
-    }
-
-    val jpeg = jpegResult.get() ?: return@withContext null
-    val raw = rawResult.get() ?: return@withContext null
-    Pair(jpeg, raw)
-}
-
 // ── Main ─────────────────────────────────────────────────────────────
 
 @Composable
 fun CameraScreen() {
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
     val scope = rememberCoroutineScope()
 
     var hasCameraPermission by remember {
@@ -333,6 +149,8 @@ fun CameraScreen() {
     // RAW
     var enableRaw by remember { mutableStateOf(false) }
     var isRawSupported by remember { mutableStateOf(false) }
+    var currentCameraId by remember { mutableStateOf<String?>(null) }
+    var sensorOrientation by remember { mutableIntStateOf(0) }
 
     // Focus
     var focusPoint by remember { mutableStateOf<Offset?>(null) }
@@ -352,6 +170,10 @@ fun CameraScreen() {
     // Camera refs
     var camera by remember { mutableStateOf<Camera?>(null) }
     var previewViewRef by remember { mutableStateOf<PreviewView?>(null) }
+    var cameraProviderRef by remember { mutableStateOf<ProcessCameraProvider?>(null) }
+
+    // 暂停状态 (RAW 捕获时暂停预览)
+    var isPreviewPaused by remember { mutableStateOf(false) }
 
     val imageCapture = remember {
         ImageCapture.Builder()
@@ -386,6 +208,35 @@ fun CameraScreen() {
         if (hasLocationPermission) enableLocation = true
     }
 
+    // 绑定 CameraX 预览的函数 (捕获后恢复用)
+    fun bindCameraPreview(pv: PreviewView) {
+        val provider = cameraProviderRef ?: return
+        val preview = Preview.Builder().setTargetAspectRatio(AspectRatio.RATIO_4_3).build()
+            .also { it.surfaceProvider = pv.surfaceProvider }
+        val selector = if (isFrontCamera) CameraSelector.DEFAULT_FRONT_CAMERA else CameraSelector.DEFAULT_BACK_CAMERA
+        try {
+            provider.unbindAll()
+            val useCaseGroup = UseCaseGroup.Builder()
+                .addUseCase(preview)
+                .addUseCase(imageCapture)
+                .addUseCase(videoCapture)
+                .setViewPort(pv.viewPort!!)
+                .build()
+            val cam = provider.bindToLifecycle(lifecycleOwner, selector, useCaseGroup)
+            camera = cam
+
+            // 记录 cameraId 和传感器方向
+            val camId = RawCaptureEngine.findCameraId(context, isFrontCamera)
+            currentCameraId = camId
+            if (camId != null) {
+                isRawSupported = RawCaptureEngine.isRawSupported(context, camId)
+                sensorOrientation = RawCaptureEngine.getSensorOrientation(context, camId)
+            }
+
+            isPreviewPaused = false
+        } catch (_: Exception) {}
+    }
+
     LaunchedEffect(Unit) {
         val needed = mutableListOf<String>()
         if (!hasCameraPermission) needed.add(Manifest.permission.CAMERA)
@@ -394,12 +245,6 @@ fun CameraScreen() {
         lastPhotoBitmap = loadLastPhotoThumbnail(context)
     }
 
-    // 检测 RAW 支持
-    LaunchedEffect(isFrontCamera) {
-        isRawSupported = isRawSupported(context, isFrontCamera)
-    }
-
-    // 获取位置
     LaunchedEffect(enableLocation, hasLocationPermission) {
         if (enableLocation && hasLocationPermission) {
             try {
@@ -425,7 +270,6 @@ fun CameraScreen() {
         showFlash = true
         try { vibrator?.vibrate(VibrationEffect.createOneShot(30, VibrationEffect.DEFAULT_AMPLITUDE)) } catch (_: Exception) {}
 
-        // 刷新位置
         if (enableLocation && hasLocationPermission) {
             try {
                 val cts = CancellationTokenSource()
@@ -434,46 +278,74 @@ fun CameraScreen() {
             } catch (_: SecurityException) {}
         }
 
-        // RAW 模式: 用 Camera2 同时捕获 JPEG + RAW
-        if (enableRaw && isRawSupported) {
+        // RAW 模式: 暂停 CameraX → Camera2 捕获 → 恢复 CameraX
+        if (enableRaw && isRawSupported && currentCameraId != null) {
             scope.launch {
                 isProcessing = true
+                isPreviewPaused = true
+
                 try {
-                    val result = captureJpegAndRaw(
-                        context, isFrontCamera, flashMode,
-                        previewViewRef?.display?.rotation?.times(90) ?: 0
+                    // 1. 暂停 CameraX 预览
+                    val provider = cameraProviderRef
+                    if (provider != null) {
+                        provider.unbindAll()
+                    }
+
+                    // 2. Camera2 捕获 JPEG + RAW
+                    val result = RawCaptureEngine.captureRawJpeg(
+                        context, isFrontCamera, flashMode, sensorOrientation
                     )
+
                     if (result != null) {
                         val (jpegBytes, dngBytes) = result
                         capturedBytes = jpegBytes
                         processedBytes = jpegBytes
 
-                        // 自动增强 JPEG
+                        // Rust 自动增强
                         try { RustBridge.autoEnhance(jpegBytes).onSuccess { processedBytes = it } }
                         catch (_: Throwable) {}
 
                         // 保存 DNG
                         withContext(Dispatchers.IO) { PhotoSaver.saveDngToGallery(context, dngBytes) }
 
-                        Toast.makeText(context, "JPEG + RAW saved", Toast.LENGTH_SHORT).show()
+                        withContext(Dispatchers.Main) {
+                            Toast.makeText(context, "JPEG + RAW saved", Toast.LENGTH_SHORT).show()
+                        }
                     } else {
                         // RAW 失败，降级到普通 JPEG
-                        Toast.makeText(context, "RAW capture failed, taking JPEG only", Toast.LENGTH_SHORT).show()
-                        imageCapture.takePicture(captureExecutor, object : ImageCapture.OnImageCapturedCallback() {
-                            override fun onCaptureSuccess(image: ImageProxy) {
-                                val jpegBytes = imageProxyToJpegBytes(image); image.close()
-                                scope.launch {
-                                    capturedBytes = jpegBytes; processedBytes = jpegBytes
-                                    try { RustBridge.autoEnhance(jpegBytes).onSuccess { processedBytes = it } }
-                                    catch (_: Throwable) {}
+                        withContext(Dispatchers.Main) {
+                            Toast.makeText(context, "RAW failed, taking JPEG", Toast.LENGTH_SHORT).show()
+                        }
+                        // 重新绑定 CameraX 并用 ImageCapture 拍照
+                        val pv = previewViewRef
+                        if (pv != null && provider != null) {
+                            bindCameraPreview(pv)
+                            delay(200) // 等预览稳定
+                            imageCapture.takePicture(captureExecutor, object : ImageCapture.OnImageCapturedCallback() {
+                                override fun onCaptureSuccess(image: ImageProxy) {
+                                    val jpegBytes = imageProxyToJpegBytes(image); image.close()
+                                    scope.launch {
+                                        capturedBytes = jpegBytes; processedBytes = jpegBytes
+                                        try { RustBridge.autoEnhance(jpegBytes).onSuccess { processedBytes = it } }
+                                        catch (_: Throwable) {}
+                                    }
                                 }
-                            }
-                            override fun onError(exception: ImageCaptureException) {}
-                        })
+                                override fun onError(exception: ImageCaptureException) {}
+                            })
+                        }
                     }
                 } catch (e: Throwable) {
-                    Toast.makeText(context, "RAW capture error: ${e.message}", Toast.LENGTH_SHORT).show()
+                    withContext(Dispatchers.Main) {
+                        Toast.makeText(context, "Capture error", Toast.LENGTH_SHORT).show()
+                    }
                 }
+
+                // 3. 恢复 CameraX 预览
+                val pv = previewViewRef
+                if (pv != null) {
+                    bindCameraPreview(pv)
+                }
+
                 isProcessing = false
                 lastPhotoBitmap = loadLastPhotoThumbnail(context)
             }
@@ -528,6 +400,7 @@ fun CameraScreen() {
     fun stopRecording() { activeRecording?.stop(); activeRecording = null; isRecording = false }
 
     fun onTapToFocus(x: Float, y: Float) {
+        if (isPreviewPaused) return
         focusPoint = Offset(x, y); showFocusRing = true
         val pv = previewViewRef ?: return; val ctrl = camera?.cameraControl ?: return
         val point = pv.meteringPointFactory.createPoint(x, y)
@@ -537,6 +410,7 @@ fun CameraScreen() {
     }
 
     fun onZoom(delta: Float) {
+        if (isPreviewPaused) return
         val ctrl = camera?.cameraControl ?: return
         zoomRatio = (zoomRatio * delta).coerceIn(1f, 10f); ctrl.setZoomRatio(zoomRatio)
     }
@@ -609,13 +483,20 @@ fun CameraScreen() {
                 selectedMode, lastPhotoBitmap,
                 isRecording, recordingDuration,
                 showExposureSlider, exposureComp,
-                enableLocation, enableRaw, isRawSupported,
-                onCameraReady = { c, pv -> camera = c; previewViewRef = pv },
+                enableLocation, enableRaw, isRawSupported, isPreviewPaused,
+                onCameraReady = { c, pv ->
+                    camera = c; previewViewRef = pv
+                    cameraProviderRef = ProcessCameraProvider.getInstance(context).get()
+                    val camId = RawCaptureEngine.findCameraId(context, isFrontCamera)
+                    currentCameraId = camId
+                    if (camId != null) {
+                        isRawSupported = RawCaptureEngine.isRawSupported(context, camId)
+                        sensorOrientation = RawCaptureEngine.getSensorOrientation(context, camId)
+                    }
+                },
                 onTap = { x, y -> onTapToFocus(x, y) },
                 onZoom = { onZoom(it) },
-                onShutter = {
-                    when (selectedMode) { 0 -> { if (isRecording) stopRecording() else startRecording() }; else -> takePhoto() }
-                },
+                onShutter = { when (selectedMode) { 0 -> { if (isRecording) stopRecording() else startRecording() }; else -> takePhoto() } },
                 onFlashToggle = { toggleFlash() },
                 onSwitchCamera = { switchCamera() },
                 onModeChange = { if (isRecording) stopRecording(); selectedMode = it },
@@ -653,7 +534,7 @@ private fun ViewfinderScreen(
     selectedMode: Int, lastPhotoBitmap: Bitmap?,
     isRecording: Boolean, recordingDuration: Int,
     showExposureSlider: Boolean, exposureComp: Float,
-    enableLocation: Boolean, enableRaw: Boolean, isRawSupported: Boolean,
+    enableLocation: Boolean, enableRaw: Boolean, isRawSupported: Boolean, isPreviewPaused: Boolean,
     onCameraReady: (Camera, PreviewView) -> Unit,
     onTap: (Float, Float) -> Unit, onZoom: (Float) -> Unit, onShutter: () -> Unit,
     onFlashToggle: () -> Unit, onSwitchCamera: () -> Unit, onModeChange: (Int) -> Unit,
@@ -665,6 +546,12 @@ private fun ViewfinderScreen(
         Box(Modifier.fillMaxSize().pointerInput(Unit) { detectTransformGestures { _, _, zoom, _ -> if (zoom != 1f) onZoom(zoom) } }) {
             CameraPreviewWithFocus(imageCapture, videoCapture, isFrontCamera, showGrid, showFocusRing, focusPoint,
                 onTap, onCameraReady, Modifier.fillMaxWidth().aspectRatio(3f / 4f).align(Alignment.Center))
+        }
+
+        // RAW 捕获时的黑色遮罩
+        if (isPreviewPaused) {
+            Box(Modifier.fillMaxSize().background(Bg.copy(alpha = 0.8f)))
+            CircularProgressIndicator(Modifier.align(Alignment.Center), color = TextPrimary)
         }
 
         if (showFlash) Box(Modifier.fillMaxSize().background(Color.White.copy(alpha = 0.7f)))
