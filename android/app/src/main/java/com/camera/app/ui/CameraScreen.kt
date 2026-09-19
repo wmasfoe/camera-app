@@ -21,7 +21,6 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.AspectRatio
 import androidx.camera.core.Camera
-import androidx.camera.core.CameraInfo
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.FocusMeteringAction
 import androidx.camera.core.ImageCapture
@@ -122,14 +121,11 @@ fun CameraScreen() {
         mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED)
     }
     var hasLocationPermission by remember {
-        mutableStateOf(
-            ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
-        )
+        mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED)
     }
 
     // Photo state
     var capturedBytes by remember { mutableStateOf<ByteArray?>(null) }
-    var capturedRawBytes by remember { mutableStateOf<ByteArray?>(null) }
     var processedBytes by remember { mutableStateOf<ByteArray?>(null) }
     var selectedFilter by remember { mutableStateOf(FilterType.NONE) }
     var isProcessing by remember { mutableStateOf(false) }
@@ -137,7 +133,7 @@ fun CameraScreen() {
     // Camera controls
     var isFrontCamera by remember { mutableStateOf(false) }
     var flashMode by remember { mutableIntStateOf(ImageCapture.FLASH_MODE_AUTO) }
-    var selectedMode by remember { mutableIntStateOf(1) } // 0=Video, 1=Photo, 2=Portrait
+    var selectedMode by remember { mutableIntStateOf(1) }
     var zoomRatio by remember { mutableFloatStateOf(1f) }
     var showGrid by remember { mutableStateOf(false) }
     var exposureComp by remember { mutableFloatStateOf(0f) }
@@ -149,7 +145,6 @@ fun CameraScreen() {
 
     // RAW
     var enableRaw by remember { mutableStateOf(false) }
-    var isRawSupported by remember { mutableStateOf(false) }
 
     // Focus
     var focusPoint by remember { mutableStateOf<Offset?>(null) }
@@ -180,10 +175,12 @@ fun CameraScreen() {
 
     val videoCapture = remember {
         val recorder = Recorder.Builder()
-            .setQualitySelector(androidx.camera.video.QualitySelector.from(
-                androidx.camera.video.Quality.HD,
-                androidx.camera.video.FallbackStrategy.higherQualityOrLowerThan(androidx.camera.video.Quality.SD)
-            ))
+            .setQualitySelector(
+                androidx.camera.video.QualitySelector.from(
+                    androidx.camera.video.Quality.HD,
+                    androidx.camera.video.FallbackStrategy.higherQualityOrLowerThan(androidx.camera.video.Quality.SD)
+                )
+            )
             .build()
         VideoCapture.withOutput(recorder)
     }
@@ -219,17 +216,10 @@ fun CameraScreen() {
                         .addOnSuccessListener { loc -> cont.resume(loc) }
                         .addOnFailureListener { cont.resume(null) }
                 }
-            } catch (_: SecurityException) {
-                currentLocation = null
-            }
+            } catch (_: SecurityException) { currentLocation = null }
         } else {
             currentLocation = null
         }
-    }
-
-    // RAW 支持默认开启（设备不支持时静默降级）
-    LaunchedEffect(Unit) {
-        isRawSupported = true
     }
 
     // Focus ring disappear
@@ -254,7 +244,7 @@ fun CameraScreen() {
 
     fun takePhoto() {
         showFlash = true
-        vibrator?.vibrate(VibrationEffect.createOneShot(30, VibrationEffect.DEFAULT_AMPLITUDE))
+        try { vibrator?.vibrate(VibrationEffect.createOneShot(30, VibrationEffect.DEFAULT_AMPLITUDE)) } catch (_: Exception) {}
 
         // 刷新位置
         if (enableLocation && hasLocationPermission) {
@@ -268,28 +258,30 @@ fun CameraScreen() {
         imageCapture.takePicture(captureExecutor, object : ImageCapture.OnImageCapturedCallback() {
             override fun onCaptureSuccess(image: ImageProxy) {
                 val jpegBytes = imageProxyToJpegBytes(image)
-
-                // RAW 捕获
-                val rawBytes: ByteArray? = if (enableRaw && image.format == ImageFormat.RAW_SENSOR) {
-                    try {
-                        val buf = image.planes[0].buffer
-                        ByteArray(buf.remaining()).also { buf.get(it) }
-                    } catch (_: Exception) { null }
-                } else null
-
                 image.close()
 
                 scope.launch {
                     isProcessing = true
                     capturedBytes = jpegBytes
-                    capturedRawBytes = rawBytes
                     processedBytes = jpegBytes
-                    RustBridge.autoEnhance(jpegBytes).onSuccess { processedBytes = it }
+
+                    // 安全调用 Rust，失败则用原图
+                    try {
+                        RustBridge.autoEnhance(jpegBytes).onSuccess { processedBytes = it }
+                    } catch (e: Throwable) {
+                        // Rust 处理失败，保持原图
+                        processedBytes = jpegBytes
+                    }
                     isProcessing = false
                     lastPhotoBitmap = loadLastPhotoThumbnail(context)
                 }
             }
-            override fun onError(exception: ImageCaptureException) {}
+
+            override fun onError(exception: ImageCaptureException) {
+                scope.launch {
+                    Toast.makeText(context, "Capture failed: ${exception.message}", Toast.LENGTH_SHORT).show()
+                }
+            }
         })
     }
 
@@ -301,22 +293,30 @@ fun CameraScreen() {
 
         val outputOptions = FileOutputOptions.Builder(videoFile).build()
 
-        activeRecording = videoCapture.output
+        // 获取当前 GPS 位置用于视频元数据
+        val videoLocation = if (enableLocation && hasLocationPermission) currentLocation else null
+
+        var recording = videoCapture.output
             .prepareRecording(ctx, outputOptions)
             .apply { if (hasAudioPermission) withAudioEnabled() }
-            .start(ContextCompat.getMainExecutor(ctx)) { event ->
-                if (event is VideoRecordEvent.Finalize) {
-                    if (event.hasError()) {
-                        scope.launch { Toast.makeText(ctx, "Recording failed", Toast.LENGTH_SHORT).show() }
-                    } else {
-                        scope.launch {
-                            val uri = PhotoSaver.saveVideoToGallery(ctx, videoFile)
-                            if (uri != null) Toast.makeText(ctx, "Video saved", Toast.LENGTH_SHORT).show()
-                            lastPhotoBitmap = loadLastPhotoThumbnail(ctx)
-                        }
+
+        // 注: CameraX VideoCapture 目前不支持直接写入 GPS 元数据
+        // GPS 信息会在保存时通过 MediaStore 写入视频文件的元数据
+        recording = recording.start(ContextCompat.getMainExecutor(ctx)) { event ->
+            if (event is VideoRecordEvent.Finalize) {
+                if (event.hasError()) {
+                    scope.launch { Toast.makeText(ctx, "Recording failed", Toast.LENGTH_SHORT).show() }
+                } else {
+                    scope.launch {
+                        val uri = PhotoSaver.saveVideoToGallery(ctx, videoFile, location = videoLocation)
+                        if (uri != null) Toast.makeText(ctx, "Video saved", Toast.LENGTH_SHORT).show()
+                        lastPhotoBitmap = loadLastPhotoThumbnail(ctx)
                     }
                 }
             }
+        }
+
+        activeRecording = recording
         isRecording = true
     }
 
@@ -355,31 +355,31 @@ fun CameraScreen() {
         selectedFilter = filter
         scope.launch {
             isProcessing = true
-            if (filter == FilterType.NONE) processedBytes = bytes
-            else RustBridge.applyFilter(bytes, filter).onSuccess { processedBytes = it }
+            if (filter == FilterType.NONE) {
+                processedBytes = bytes
+            } else {
+                try {
+                    RustBridge.applyFilter(bytes, filter).onSuccess { processedBytes = it }
+                } catch (_: Throwable) {
+                    processedBytes = bytes
+                }
+            }
             isProcessing = false
         }
     }
 
     fun retake() {
-        capturedBytes = null; capturedRawBytes = null; processedBytes = null; selectedFilter = FilterType.NONE
+        capturedBytes = null; processedBytes = null; selectedFilter = FilterType.NONE
     }
 
     fun save() {
         val bytes = processedBytes ?: return
         scope.launch {
-            // 保存 JPEG（带 GPS）
             val uri = PhotoSaver.saveJpegToGallery(context, bytes, location = currentLocation)
             if (uri == null) {
                 Toast.makeText(context, "Failed", Toast.LENGTH_SHORT).show()
                 return@launch
             }
-
-            // 保存 RAW（如果有）
-            capturedRawBytes?.let { raw ->
-                PhotoSaver.saveDngToGallery(context, raw)
-            }
-
             Toast.makeText(context, "Saved", Toast.LENGTH_SHORT).show()
             retake()
         }
@@ -400,11 +400,8 @@ fun CameraScreen() {
 
     fun openGallery() {
         try {
-            context.startActivity(Intent(Intent.ACTION_VIEW, MediaStore.Images.Media.EXTERNAL_CONTENT_URI)
-                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-        } catch (_: Exception) {
-            Toast.makeText(context, "No gallery app found", Toast.LENGTH_SHORT).show()
-        }
+            context.startActivity(Intent(Intent.ACTION_VIEW, MediaStore.Images.Media.EXTERNAL_CONTENT_URI).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        } catch (_: Exception) { Toast.makeText(context, "No gallery app", Toast.LENGTH_SHORT).show() }
     }
 
     fun toggleLocation() {
@@ -435,7 +432,7 @@ fun CameraScreen() {
                 selectedMode, lastPhotoBitmap,
                 isRecording, recordingDuration,
                 showExposureSlider, exposureComp,
-                enableLocation, enableRaw, isRawSupported,
+                enableLocation, enableRaw,
                 onCameraReady = { c, pv -> camera = c; previewViewRef = pv },
                 onTap = { x, y -> onTapToFocus(x, y) },
                 onZoom = { onZoom(it) },
@@ -496,7 +493,6 @@ private fun ViewfinderScreen(
     exposureComp: Float,
     enableLocation: Boolean,
     enableRaw: Boolean,
-    isRawSupported: Boolean,
     onCameraReady: (Camera, PreviewView) -> Unit,
     onTap: (Float, Float) -> Unit,
     onZoom: (Float) -> Unit,
@@ -522,12 +518,10 @@ private fun ViewfinderScreen(
 
         if (showFlash) Box(Modifier.fillMaxSize().background(Color.White.copy(alpha = 0.7f)))
 
-        // Top bar
-        TopBar(flashMode, showGrid, enableLocation, enableRaw, isRawSupported,
+        TopBar(flashMode, showGrid, enableLocation, enableRaw,
             onFlashToggle, onGridToggle, onExposureToggle, onLocationToggle, onRawToggle,
             Modifier.align(Alignment.TopStart).statusBarsPadding().padding(horizontal = 16.dp, vertical = 8.dp))
 
-        // Zoom indicator
         if (zoomRatio > 1.05f) {
             Text("${String.format("%.1f", zoomRatio)}x", color = TextPrimary, fontSize = 13.sp,
                 fontWeight = FontWeight.SemiBold,
@@ -536,13 +530,11 @@ private fun ViewfinderScreen(
                     .padding(horizontal = 10.dp, vertical = 4.dp))
         }
 
-        // Exposure slider
         if (showExposureSlider) {
             ExposureSlider(exposureComp, onExposureChange,
                 Modifier.align(Alignment.CenterEnd).padding(end = 16.dp))
         }
 
-        // Recording indicator
         if (isRecording) {
             RecordingIndicator(recordingDuration,
                 Modifier.align(Alignment.TopCenter).statusBarsPadding().padding(top = 12.dp))
@@ -570,7 +562,6 @@ private fun ViewfinderScreen(
             }
         }
 
-        // Bottom controls
         BottomControls(selectedMode, lastPhotoBitmap, isRecording,
             onModeChange, onShutter, onSwitchCamera, onGalleryClick,
             Modifier.align(Alignment.BottomStart).navigationBarsPadding().padding(bottom = 24.dp))
@@ -685,7 +676,7 @@ private fun RecordingIndicator(duration: Int, modifier: Modifier) {
 
 @Composable
 private fun TopBar(
-    flashMode: Int, showGrid: Boolean, enableLocation: Boolean, enableRaw: Boolean, isRawSupported: Boolean,
+    flashMode: Int, showGrid: Boolean, enableLocation: Boolean, enableRaw: Boolean,
     onFlashToggle: () -> Unit, onGridToggle: () -> Unit, onExposureToggle: () -> Unit,
     onLocationToggle: () -> Unit, onRawToggle: () -> Unit, modifier: Modifier
 ) {
@@ -695,22 +686,15 @@ private fun TopBar(
         else -> Icons.Default.FlashAuto
     }
     Row(modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-        // Left: flash
         CircleIconButton(flashIcon, if (flashMode == ImageCapture.FLASH_MODE_OFF) AccentDim else TextMuted, onClick = onFlashToggle)
-
-        // Right: grid, EV, GPS, RAW
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             CircleIconButton(Icons.Default.GridOn, if (showGrid) TextPrimary else TextMuted, onClick = onGridToggle)
             CircleIconButton(Icons.Default.Brightness6, TextMuted, onClick = onExposureToggle)
             CircleIconButton(Icons.Default.LocationOn, if (enableLocation) TextPrimary else TextMuted, onClick = onLocationToggle)
-            if (isRawSupported) {
-                // RAW 用文字标签（图标不明显）
-                Box(Modifier.size(36.dp).background(Surface2.copy(alpha = 0.6f), CircleShape)
-                    .clickable(remember { MutableInteractionSource() }, null) { onRawToggle() },
-                    contentAlignment = Alignment.Center) {
-                    Text("R", color = if (enableRaw) TextPrimary else TextMuted,
-                        fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                }
+            Box(Modifier.size(36.dp).background(Surface2.copy(alpha = 0.6f), CircleShape)
+                .clickable(remember { MutableInteractionSource() }, null) { onRawToggle() },
+                contentAlignment = Alignment.Center) {
+                Text("R", color = if (enableRaw) TextPrimary else TextMuted, fontSize = 11.sp, fontWeight = FontWeight.Bold)
             }
         }
     }
@@ -738,9 +722,7 @@ private fun BottomControls(selectedMode: Int, lastPhotoBitmap: Bitmap?, isRecord
                 contentAlignment = Alignment.Center) {
                 if (lastPhotoBitmap != null) {
                     Image(lastPhotoBitmap.asImageBitmap(), null, Modifier.size(42.dp).clip(RoundedCornerShape(8.dp)), contentScale = ContentScale.Crop)
-                } else {
-                    Icon(Icons.Default.GridOn, null, tint = TextMuted, modifier = Modifier.size(20.dp))
-                }
+                } else { Icon(Icons.Default.GridOn, null, tint = TextMuted, modifier = Modifier.size(20.dp)) }
             }
             if (selectedMode == 0) {
                 Box(Modifier.size(72.dp).border(3.dp, if (isRecording) Danger else TextPrimary, CircleShape)
@@ -831,9 +813,7 @@ private fun imageProxyToJpegBytes(image: ImageProxy): ByteArray {
         val ySize = y.remaining()
         val uvSize = u.remaining().coerceAtMost(v.remaining())
         val nv21 = ByteArray(ySize + uvSize * 2)
-        // Y plane
         y.get(nv21, 0, ySize)
-        // Interleave V,U into NV21 format (VUVU...)
         val uvOffset = ySize
         for (i in 0 until uvSize) {
             nv21[uvOffset + i * 2] = v.get(i)
