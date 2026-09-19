@@ -284,7 +284,8 @@ fun CameraScreen() {
     fun setExposure(value: Float) {
         exposureComp = value
         val ctrl = camera?.cameraControl ?: return
-        val range = ctrl.exposureState.exposureCompensationRange
+        val info = camera?.cameraInfo ?: return
+        val range = info.exposureState.exposureCompensationRange
         val index = (value * (range.upper - range.lower) / 2 + (range.upper + range.lower) / 2).toInt()
             .coerceIn(range.lower, range.upper)
         ctrl.setExposureCompensationIndex(index)
