@@ -134,10 +134,7 @@ jobs:
           path: ios/CameraApp/Generated/
 
       - name: Select Xcode version
-        run: |
-          sudo xcode-select -s /Applications/Xcode_16.2.app/Contents/Developer || \
-          sudo xcode-select -s /Applications/Xcode_16.1.app/Contents/Developer || \
-          sudo xcode-select -s /Applications/Xcode_16.0.app/Contents/Developer || true
+        run: xcode-select -p
 
       - name: Install xcodegen
         run: brew install xcodegen
