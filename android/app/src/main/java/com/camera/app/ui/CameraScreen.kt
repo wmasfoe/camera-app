@@ -497,6 +497,7 @@ fun CameraScreen() {
                 isRecording, recordingDuration,
                 showExposureSlider, exposureComp,
                 enableLocation, enableRaw, isRawSupported, isPreviewPaused,
+                currentLocation, isLocationLoading,
                 onCameraReady = { c, pv ->
                     camera = c; previewViewRef = pv
                     cameraProviderRef = ProcessCameraProvider.getInstance(context).get()
@@ -548,6 +549,7 @@ private fun ViewfinderScreen(
     isRecording: Boolean, recordingDuration: Int,
     showExposureSlider: Boolean, exposureComp: Float,
     enableLocation: Boolean, enableRaw: Boolean, isRawSupported: Boolean, isPreviewPaused: Boolean,
+    currentLocation: Location?, isLocationLoading: Boolean,
     onCameraReady: (Camera, PreviewView) -> Unit,
     onTap: (Float, Float) -> Unit, onZoom: (Float) -> Unit, onShutter: () -> Unit,
     onFlashToggle: () -> Unit, onSwitchCamera: () -> Unit, onModeChange: (Int) -> Unit,
