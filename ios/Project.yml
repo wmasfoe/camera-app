@@ -39,6 +39,5 @@ targets:
         OTHER_LDFLAGS:
           - "-lcamera_shared_core"
         LIBRARY_SEARCH_PATHS:
-          - "$(SRCROOT)/../target/aarch64-apple-ios/release"
           - "$(SRCROOT)/../target/universal-sim/release"
     dependencies: []
