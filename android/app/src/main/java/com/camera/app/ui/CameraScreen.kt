@@ -850,7 +850,7 @@ private fun CameraPreviewWithFocus(
 }
 
 @Composable private fun BottomControls(selectedMode: Int, lastPhotoBitmap: Bitmap?, isRecording: Boolean,
-    onModeChange: (Int) -> Unit, onShutter: () -> Unit, onSwitchCamera: () -> Unit, onGalleryClick: () -> Unit, modifier: Modifier) {
+    onModeChange: (Int) -> Unit, onShutter: () -> Unit, onSwitchCamera: () -> Unit, onGalleryClick: () -> Unit, modifier: Modifier = Modifier) {
     val modes = listOf("VIDEO", "PHOTO", "PORTRAIT")
     Column(modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
         // 模式选择器
