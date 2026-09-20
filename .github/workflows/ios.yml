@@ -30,7 +30,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
 
       - name: Cache Cargo
         uses: actions/cache@v4
@@ -49,28 +49,12 @@ jobs:
       - name: Build Rust for iOS simulator (arm64)
         working-directory: shared-core
         run: cargo build --release --target aarch64-apple-ios-sim --lib
-        continue-on-error: true
-
-      - name: Build Rust for iOS simulator (x86_64)
-        working-directory: shared-core
-        run: cargo build --release --target x86_64-apple-ios --lib
-        continue-on-error: true
 
       - name: Create universal simulator library
         working-directory: shared-core
         run: |
-          if [ -f ../target/aarch64-apple-ios-sim/release/libcamera_shared_core.a ] && \
-             [ -f ../target/x86_64-apple-ios/release/libcamera_shared_core.a ]; then
-            mkdir -p ../target/universal-sim/release
-            lipo -create \
-              ../target/aarch64-apple-ios-sim/release/libcamera_shared_core.a \
-              ../target/x86_64-apple-ios/release/libcamera_shared_core.a \
-              -output ../target/universal-sim/release/libcamera_shared_core.a
-          else
-            echo "⚠️ Simulator builds not available, skipping lipo"
-            mkdir -p ../target/universal-sim/release
-            cp ../target/aarch64-apple-ios/release/libcamera_shared_core.a ../target/universal-sim/release/ || true
-          fi
+          mkdir -p ../target/universal-sim/release
+          cp ../target/aarch64-apple-ios-sim/release/libcamera_shared_core.a ../target/universal-sim/release/
 
       - name: Generate UniFFI Swift bindings
         working-directory: shared-core
