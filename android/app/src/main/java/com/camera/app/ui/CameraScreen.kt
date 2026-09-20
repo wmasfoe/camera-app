@@ -223,22 +223,9 @@ fun CameraScreen() {
         val provider = cameraProviderRef ?: return
         val preview = Preview.Builder().setTargetAspectRatio(AspectRatio.RATIO_4_3).build()
             .also { it.surfaceProvider = pv.surfaceProvider }
-        // 根据 cameraIndex 选择具体相机
-        val selector = if (isFrontCamera) {
-            CameraSelector.DEFAULT_FRONT_CAMERA
-        } else {
-            val cameras = RawCaptureEngine.listCameras(context).filter { it.facing == android.hardware.camera2.CameraCharacteristics.LENS_FACING_BACK }
-            val targetCam = cameras.getOrNull(backCameraIndex) ?: cameras.firstOrNull()
-            if (targetCam != null) {
-                val targetId = targetCam.id
-                CameraSelector.Builder().addCameraFilter { cameraInfos ->
-                    cameraInfos.filter { info ->
-                        val cam2Info = androidx.camera.camera2.interop.Camera2CameraInfo.from(info)
-                        cam2Info.cameraId == targetId
-                    }
-                }.build()
-            } else CameraSelector.DEFAULT_BACK_CAMERA
-        }
+        // CameraX 预览始终用默认后置 (CameraX 会选主摄)
+        // 超广角切换在 Camera2 RAW 捕获路径生效
+        val selector = if (isFrontCamera) CameraSelector.DEFAULT_FRONT_CAMERA else CameraSelector.DEFAULT_BACK_CAMERA
         try {
             provider.unbindAll()
             val useCaseGroup = UseCaseGroup.Builder()
@@ -251,11 +238,7 @@ fun CameraScreen() {
             camera = cam
 
             // 记录 cameraId 和传感器方向
-            val camId = if (isFrontCamera) RawCaptureEngine.findCameraId(context, true)
-            else {
-                val cameras = RawCaptureEngine.listCameras(context).filter { it.facing == android.hardware.camera2.CameraCharacteristics.LENS_FACING_BACK }
-                cameras.getOrNull(backCameraIndex)?.id ?: cameras.firstOrNull()?.id
-            }
+            val camId = RawCaptureEngine.findCameraId(context, isFrontCamera)
             currentCameraId = camId
             if (camId != null) {
                 isRawSupported = RawCaptureEngine.isRawSupported(context, camId)
@@ -555,13 +538,12 @@ fun CameraScreen() {
                 onCameraReady = { c, pv ->
                     camera = c; previewViewRef = pv
                     cameraProviderRef = ProcessCameraProvider.getInstance(context).get()
-                    // 统计后置相机数量
+                    // 统计后置相机数量 (用于 UI 显示镜头切换按钮)
                     val backCams = RawCaptureEngine.listCameras(context).filter {
                         it.facing == android.hardware.camera2.CameraCharacteristics.LENS_FACING_BACK
                     }
                     backCameraCount = backCams.size.coerceAtLeast(1)
-                    val camId = if (isFrontCamera) RawCaptureEngine.findCameraId(context, true)
-                    else backCams.getOrNull(backCameraIndex)?.id ?: backCams.firstOrNull()?.id
+                    val camId = RawCaptureEngine.findCameraId(context, isFrontCamera)
                     currentCameraId = camId
                     if (camId != null) {
                         isRawSupported = RawCaptureEngine.isRawSupported(context, camId)
