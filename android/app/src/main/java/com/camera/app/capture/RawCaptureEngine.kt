@@ -8,6 +8,7 @@ import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.DngCreator
 import android.hardware.camera2.TotalCaptureResult
 import android.hardware.camera2.params.OutputConfiguration
@@ -247,15 +248,15 @@ class RawCaptureEngine(private val context: Context) {
             suspendCancellableCoroutine<Unit> { cont ->
                 sess.capture(preCaptureBuilder.build(), object : CameraCaptureSession.CaptureCallback() {
                     override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
-                        val afState = result.get(CaptureRequest.CONTROL_AF_STATE)
-                        val aeState = result.get(CaptureRequest.CONTROL_AE_STATE)
+                        val afState = result.get(CaptureResult.CONTROL_AF_STATE)
+                        val aeState = result.get(CaptureResult.CONTROL_AE_STATE)
                         // AF 已收敛或 AE 已锁定时继续
-                        if (afState == CaptureRequest.CONTROL_AF_STATE_FOCUSED_LOCKED ||
-                            afState == CaptureRequest.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED ||
-                            afState == CaptureRequest.CONTROL_AF_STATE_PASSIVE_FOCUSED ||
-                            aeState == CaptureRequest.CONTROL_AE_STATE_CONVERGED ||
-                            aeState == CaptureRequest.CONTROL_AE_STATE_FLASH_REQUIRED ||
-                            aeState == CaptureRequest.CONTROL_AE_STATE_LOCKED) {
+                        if (afState == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED ||
+                            afState == CaptureResult.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED ||
+                            afState == CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED ||
+                            aeState == CaptureResult.CONTROL_AE_STATE_CONVERGED ||
+                            aeState == CaptureResult.CONTROL_AE_STATE_FLASH_REQUIRED ||
+                            aeState == CaptureResult.CONTROL_AE_STATE_LOCKED) {
                             if (cont.isActive) cont.resume(Unit)
                         }
                     }
