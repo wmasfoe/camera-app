@@ -1,0 +1,163 @@
+name: iOS Build
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "shared-core/**"
+      - "ios/**"
+      - "scripts/build-ios.sh"
+      - ".github/workflows/ios.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "shared-core/**"
+      - "ios/**"
+      - "scripts/build-ios.sh"
+      - ".github/workflows/ios.yml"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Rust → iOS static library + UniFFI bindings ──────────────────
+  rust-ios:
+    name: Rust → iOS (.a + Swift)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            shared-core/target
+          key: rust-ios-${{ hashFiles('shared-core/Cargo.lock', 'shared-core/Cargo.toml') }}
+          restore-keys: rust-ios-
+
+      - name: Build Rust for iOS device (arm64)
+        working-directory: shared-core
+        run: cargo build --release --target aarch64-apple-ios
+
+      - name: Build Rust for iOS simulator (arm64)
+        working-directory: shared-core
+        run: cargo build --release --target aarch64-apple-ios-sim
+
+      - name: Build Rust for iOS simulator (x86_64)
+        working-directory: shared-core
+        run: cargo build --release --target x86_64-apple-ios
+
+      - name: Create universal simulator library
+        run: |
+          mkdir -p shared-core/target/universal-sim/release
+          lipo -create \
+            shared-core/target/aarch64-apple-ios-sim/release/libcamera_shared_core.a \
+            shared-core/target/x86_64-apple-ios/release/libcamera_shared_core.a \
+            -output shared-core/target/universal-sim/release/libcamera_shared_core.a
+
+      - name: Generate UniFFI Swift bindings
+        working-directory: shared-core
+        run: |
+          mkdir -p ../ios/CameraApp/Generated
+          cargo run --bin uniffi-bindgen -- generate \
+            --library target/aarch64-apple-ios/release/libcamera_shared_core.a \
+            --language swift \
+            --out-dir ../ios/CameraApp/Generated/
+
+      - name: Upload device library
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-device-lib
+          path: shared-core/target/aarch64-apple-ios/release/libcamera_shared_core.a
+
+      - name: Upload simulator library
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-sim-lib
+          path: shared-core/target/universal-sim/release/libcamera_shared_core.a
+
+      - name: Upload Swift bindings
+        uses: actions/upload-artifact@v4
+        with:
+          name: swift-bindings
+          path: |
+            ios/CameraApp/Generated/camera_shared_core.swift
+            ios/CameraApp/Generated/camera_shared_core.h
+
+  # ── iOS App Build ─────────────────────────────────────────────────
+  ios-build:
+    name: iOS App Build
+    runs-on: macos-latest
+    needs: rust-ios
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download device library
+        uses: actions/download-artifact@v4
+        with:
+          name: ios-device-lib
+          path: shared-core/target/aarch64-apple-ios/release/
+
+      - name: Download simulator library
+        uses: actions/download-artifact@v4
+        with:
+          name: ios-sim-lib
+          path: shared-core/target/universal-sim/release/
+
+      - name: Download Swift bindings
+        uses: actions/download-artifact@v4
+        with:
+          name: swift-bindings
+          path: ios/CameraApp/Generated/
+
+      - name: Select Xcode version
+        run: sudo xcode-select -s /Applications/Xcode_15.4.app/Contents/Developer
+
+      - name: Build iOS app (simulator)
+        working-directory: ios
+        run: |
+          xcodebuild build \
+            -project CameraApp.xcodeproj \
+            -scheme CameraApp \
+            -destination 'generic/platform=iOS Simulator' \
+            -configuration Release \
+            -derivedDataPath build \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            | xcpretty
+
+      - name: Archive unsigned .app
+        run: |
+          mkdir -p artifacts
+          APP_PATH=$(find ios/build -name "CameraApp.app" -type d | head -1)
+          if [[ -n "$APP_PATH" ]]; then
+            cp -R "$APP_PATH" artifacts/
+          fi
+
+      - name: Upload unsigned .app
+        uses: actions/upload-artifact@v4
+        with:
+          name: camera-app-ios-unsigned
+          path: artifacts/CameraApp.app
+          if-no-files-found: warn
+
+  # ── SwiftLint (optional) ──────────────────────────────────────────
+  swiftlint:
+    name: SwiftLint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: SwiftLint
+        uses: norio-nomura/action-swiftlint@3.2.1
+        with:
+          args: --strict --path ios/
+        continue-on-error: true
