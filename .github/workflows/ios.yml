@@ -150,7 +150,7 @@ jobs:
           xcodebuild build \
             -project CameraApp.xcodeproj \
             -scheme CameraApp \
-            -destination 'generic/platform=iOS Simulator,arch=arm64' \
+            -destination 'generic/platform=iOS Simulator' \
             -configuration Release \
             -derivedDataPath build \
             CODE_SIGN_IDENTITY="" \
