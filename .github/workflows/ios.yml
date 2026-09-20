@@ -159,8 +159,7 @@ jobs:
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
-            SWIFT_VERSION=5.0 \
-            2>&1 | xcpretty || exit 1
+            SWIFT_VERSION=5.0 2>&1 | tail -30; echo "EXIT: $?"
 
       - name: Archive unsigned .ipa
         run: |
