@@ -58,6 +58,7 @@ import androidx.compose.material.icons.filled.FlashAuto
 import androidx.compose.material.icons.filled.FlashOff
 import androidx.compose.material.icons.filled.FlashOn
 import androidx.compose.material.icons.filled.GridOn
+import androidx.compose.material.icons.filled.Landscape
 import androidx.compose.material.icons.filled.LocationOn
 import androidx.compose.material.icons.filled.PhotoCamera
 import androidx.compose.material3.*
@@ -141,6 +142,8 @@ fun CameraScreen() {
 
     // Camera controls
     var isFrontCamera by remember { mutableStateOf(false) }
+    var backCameraIndex by remember { mutableIntStateOf(0) }  // 0=主摄, 1=超广角, 2=长焦
+    var backCameraCount by remember { mutableIntStateOf(1) }
     var flashMode by remember { mutableIntStateOf(ImageCapture.FLASH_MODE_AUTO) }
     var selectedMode by remember { mutableIntStateOf(1) }
     var zoomRatio by remember { mutableFloatStateOf(1f) }
@@ -220,7 +223,22 @@ fun CameraScreen() {
         val provider = cameraProviderRef ?: return
         val preview = Preview.Builder().setTargetAspectRatio(AspectRatio.RATIO_4_3).build()
             .also { it.surfaceProvider = pv.surfaceProvider }
-        val selector = if (isFrontCamera) CameraSelector.DEFAULT_FRONT_CAMERA else CameraSelector.DEFAULT_BACK_CAMERA
+        // 根据 cameraIndex 选择具体相机
+        val selector = if (isFrontCamera) {
+            CameraSelector.DEFAULT_FRONT_CAMERA
+        } else {
+            val cameras = RawCaptureEngine.listCameras(context).filter { it.facing == android.hardware.camera2.CameraCharacteristics.LENS_FACING_BACK }
+            val targetCam = cameras.getOrNull(backCameraIndex) ?: cameras.firstOrNull()
+            if (targetCam != null) {
+                val targetId = targetCam.id
+                CameraSelector.Builder().addCameraFilter { cameraInfos ->
+                    cameraInfos.filter { info ->
+                        val cam2Info = androidx.camera.camera2.interop.Camera2CameraInfo.from(info)
+                        cam2Info.cameraId == targetId
+                    }
+                }.build()
+            } else CameraSelector.DEFAULT_BACK_CAMERA
+        }
         try {
             provider.unbindAll()
             val useCaseGroup = UseCaseGroup.Builder()
@@ -233,7 +251,11 @@ fun CameraScreen() {
             camera = cam
 
             // 记录 cameraId 和传感器方向
-            val camId = RawCaptureEngine.findCameraId(context, isFrontCamera)
+            val camId = if (isFrontCamera) RawCaptureEngine.findCameraId(context, true)
+            else {
+                val cameras = RawCaptureEngine.listCameras(context).filter { it.facing == android.hardware.camera2.CameraCharacteristics.LENS_FACING_BACK }
+                cameras.getOrNull(backCameraIndex)?.id ?: cameras.firstOrNull()?.id
+            }
             currentCameraId = camId
             if (camId != null) {
                 isRawSupported = RawCaptureEngine.isRawSupported(context, camId)
@@ -255,6 +277,13 @@ fun CameraScreen() {
     LaunchedEffect(enableLocation, hasLocationPermission) {
         if (enableLocation && hasLocationPermission) {
             isLocationLoading = true
+            // 先用 lastLocation 快速填充
+            try {
+                fusedLocationClient.lastLocation.addOnSuccessListener { loc ->
+                    if (loc != null && currentLocation == null) currentLocation = loc
+                }
+            } catch (_: Exception) {}
+            // 再获取精确位置
             try {
                 val cts = CancellationTokenSource()
                 currentLocation = suspendCancellableCoroutine { cont ->
@@ -279,11 +308,15 @@ fun CameraScreen() {
         showFlash = true
         try { vibrator?.vibrate(VibrationEffect.createOneShot(30, VibrationEffect.DEFAULT_AMPLITUDE)) } catch (_: Exception) {}
 
+        // GPS: 优先用 lastLocation 快速获取，再异步更新为最新位置
         if (enableLocation && hasLocationPermission) {
             try {
+                fusedLocationClient.lastLocation.addOnSuccessListener { loc ->
+                    if (loc != null) currentLocation = loc
+                }
                 val cts = CancellationTokenSource()
                 fusedLocationClient.getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, cts.token)
-                    .addOnSuccessListener { loc -> currentLocation = loc }
+                    .addOnSuccessListener { loc -> if (loc != null) currentLocation = loc }
             } catch (_: SecurityException) {}
         }
 
@@ -471,7 +504,16 @@ fun CameraScreen() {
         imageCapture.flashMode = flashMode
     }
 
-    fun switchCamera() { isFrontCamera = !isFrontCamera; zoomRatio = 1f; exposureComp = 0f }
+    fun switchCamera() { isFrontCamera = !isFrontCamera; backCameraIndex = 0; zoomRatio = 1f; exposureComp = 0f }
+
+    fun cycleLens() {
+        if (backCameraCount <= 1) return
+        backCameraIndex = (backCameraIndex + 1) % backCameraCount
+        zoomRatio = 1f
+        // 重新绑定预览
+        val pv = previewViewRef ?: return
+        bindCameraPreview(pv)
+    }
 
     fun setZoomPreset(target: Float) {
         val cam = camera ?: return
@@ -513,7 +555,13 @@ fun CameraScreen() {
                 onCameraReady = { c, pv ->
                     camera = c; previewViewRef = pv
                     cameraProviderRef = ProcessCameraProvider.getInstance(context).get()
-                    val camId = RawCaptureEngine.findCameraId(context, isFrontCamera)
+                    // 统计后置相机数量
+                    val backCams = RawCaptureEngine.listCameras(context).filter {
+                        it.facing == android.hardware.camera2.CameraCharacteristics.LENS_FACING_BACK
+                    }
+                    backCameraCount = backCams.size.coerceAtLeast(1)
+                    val camId = if (isFrontCamera) RawCaptureEngine.findCameraId(context, true)
+                    else backCams.getOrNull(backCameraIndex)?.id ?: backCams.firstOrNull()?.id
                     currentCameraId = camId
                     if (camId != null) {
                         isRawSupported = RawCaptureEngine.isRawSupported(context, camId)
@@ -532,7 +580,9 @@ fun CameraScreen() {
                 onExposureChange = { setExposure(it) },
                 onLocationToggle = { toggleLocation() },
                 onRawToggle = { enableRaw = !enableRaw },
-                onZoomPreset = { setZoomPreset(it) }
+                onZoomPreset = { setZoomPreset(it) },
+                onCycleLens = { cycleLens() },
+                backCameraCount = backCameraCount
             )
         }
     }
@@ -568,7 +618,8 @@ private fun ViewfinderScreen(
     onFlashToggle: () -> Unit, onSwitchCamera: () -> Unit, onModeChange: (Int) -> Unit,
     onGridToggle: () -> Unit, onGalleryClick: () -> Unit,
     onExposureToggle: () -> Unit, onExposureChange: (Float) -> Unit,
-    onLocationToggle: () -> Unit, onRawToggle: () -> Unit, onZoomPreset: (Float) -> Unit
+    onLocationToggle: () -> Unit, onRawToggle: () -> Unit, onZoomPreset: (Float) -> Unit,
+    onCycleLens: () -> Unit, backCameraCount: Int = 1
 ) {
     val isLandscape = LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
 
@@ -634,7 +685,8 @@ private fun ViewfinderScreen(
                 Spacer(Modifier.height(12.dp))
                 // 模式选择 + 快门
                 BottomControls(selectedMode, lastPhotoBitmap, isRecording,
-                    onModeChange, onShutter, onSwitchCamera, onGalleryClick)
+                    onModeChange, onShutter, onSwitchCamera, onGalleryClick,
+                    onCycleLens = onCycleLens, backCameraCount = backCameraCount)
             }
 
         } else {
@@ -701,7 +753,10 @@ private fun ViewfinderScreen(
                         Box(Modifier.size(52.dp).background(TextPrimary, CircleShape))
                     }
                 }
-                // 切换摄像头
+                // 切换摄像头 + 镜头
+                if (backCameraCount > 1) {
+                    CircleIconButton(Icons.Default.Landscape, AccentGreen, size = 34, onClick = onCycleLens)
+                }
                 CircleIconButton(Icons.Default.Cameraswitch, TextPrimary, size = 38, onClick = onSwitchCamera)
             }
         }
@@ -804,17 +859,17 @@ private fun CameraPreviewWithFocus(
     if (isLandscape) {
         Row(modifier.height(40.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Icon(Icons.Default.Brightness6, null, tint = TextMuted, modifier = Modifier.size(16.dp))
-            Slider(value = value, onValueChange = onChange, valueRange = -1f..1f, modifier = Modifier.width(200.dp),
+            Slider(value = value, onValueChange = onChange, valueRange = -1f..1f, modifier = Modifier.width(280.dp),
                 colors = SliderDefaults.colors(thumbColor = TextPrimary, activeTrackColor = TextPrimary, inactiveTrackColor = AccentDim))
             Text("%.1f".format(value), color = TextMuted, fontSize = 11.sp, fontWeight = FontWeight.Medium, modifier = Modifier.width(30.dp))
         }
     } else {
         // 竖直滑块: 旋转 -90° 实现垂直交互 (上=增亮, 下=减暗)
-        Column(modifier.width(44.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+        Column(modifier.height(250.dp).width(44.dp), horizontalAlignment = Alignment.CenterHorizontally) {
             Text("%.1f".format(value), color = TextMuted, fontSize = 10.sp, fontWeight = FontWeight.Medium)
             Spacer(Modifier.height(6.dp))
             Slider(value = value, onValueChange = onChange, valueRange = -1f..1f,
-                modifier = Modifier.width(180.dp).graphicsLayer { rotationZ = -90f },
+                modifier = Modifier.width(250.dp).graphicsLayer { rotationZ = -90f },
                 colors = SliderDefaults.colors(thumbColor = TextPrimary, activeTrackColor = TextPrimary, inactiveTrackColor = AccentDim))
             Spacer(Modifier.height(6.dp))
             Icon(Icons.Default.Brightness6, null, tint = TextMuted, modifier = Modifier.size(16.dp))
@@ -850,7 +905,8 @@ private fun CameraPreviewWithFocus(
 }
 
 @Composable private fun BottomControls(selectedMode: Int, lastPhotoBitmap: Bitmap?, isRecording: Boolean,
-    onModeChange: (Int) -> Unit, onShutter: () -> Unit, onSwitchCamera: () -> Unit, onGalleryClick: () -> Unit, modifier: Modifier = Modifier) {
+    onModeChange: (Int) -> Unit, onShutter: () -> Unit, onSwitchCamera: () -> Unit, onGalleryClick: () -> Unit,
+    onCycleLens: (() -> Unit)? = null, backCameraCount: Int = 1, modifier: Modifier = Modifier) {
     val modes = listOf("VIDEO", "PHOTO", "PORTRAIT")
     Column(modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
         // 模式选择器
@@ -892,8 +948,13 @@ private fun CameraPreviewWithFocus(
                     Box(Modifier.size(60.dp).background(TextPrimary, CircleShape))
                 }
             }
-            // 前后摄切换
-            CircleIconButton(Icons.Default.Cameraswitch, TextPrimary, size = 42, onClick = onSwitchCamera)
+            // 前后摄 + 镜头切换
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                if (backCameraCount > 1 && onCycleLens != null) {
+                    CircleIconButton(Icons.Default.Landscape, AccentGreen, size = 38, onClick = onCycleLens)
+                }
+                CircleIconButton(Icons.Default.Cameraswitch, TextPrimary, size = 42, onClick = onSwitchCamera)
+            }
         }
     }
 }

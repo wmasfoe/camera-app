@@ -86,17 +86,42 @@ class RawCaptureEngine(private val context: Context) {
         }
 
         /**
-         * 根据前后置查找 cameraId
+         * 相机信息
          */
-        fun findCameraId(context: Context, facingFront: Boolean): String? {
+        data class CameraInfo(
+            val id: String,
+            val facing: Int,  // CameraCharacteristics.LENS_FACING_*
+            val focalLengths: FloatArray,
+            val isUltraWide: Boolean
+        )
+
+        /**
+         * 列出所有相机及其焦距
+         */
+        fun listCameras(context: Context): List<CameraInfo> {
             val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
-            for (id in manager.cameraIdList) {
+            return manager.cameraIdList.map { id ->
+                val chars = manager.getCameraCharacteristics(id)
+                val facing = chars.get(CameraCharacteristics.LENS_FACING) ?: CameraCharacteristics.LENS_FACING_BACK
+                val focalLengths = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS) ?: floatArrayOf()
+                // 超广角判断: 焦距 < 2.5mm (通常 1.x mm)
+                val isUltraWide = focalLengths.isNotEmpty() && focalLengths[0] < 2.5f && facing == CameraCharacteristics.LENS_FACING_BACK
+                CameraInfo(id, facing, focalLengths, isUltraWide)
+            }
+        }
+
+        /**
+         * 根据前后置查找 cameraId (默认主摄)
+         */
+        fun findCameraId(context: Context, facingFront: Boolean, cameraIndex: Int = 0): String? {
+            val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+            val matching = manager.cameraIdList.filter { id ->
                 val chars = manager.getCameraCharacteristics(id)
                 val facing = chars.get(CameraCharacteristics.LENS_FACING)
-                if (facingFront && facing == CameraCharacteristics.LENS_FACING_FRONT) return id
-                if (!facingFront && facing == CameraCharacteristics.LENS_FACING_BACK) return id
+                if (facingFront) facing == CameraCharacteristics.LENS_FACING_FRONT
+                else facing == CameraCharacteristics.LENS_FACING_BACK
             }
-            return null
+            return matching.getOrNull(cameraIndex)
         }
     }
 
