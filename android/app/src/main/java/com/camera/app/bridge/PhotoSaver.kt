@@ -62,9 +62,10 @@ object PhotoSaver {
         }
     }
 
-    suspend fun saveDngToGallery(context: Context, dngBytes: ByteArray, displayName: String? = null): Uri? =
+    suspend fun saveDngToGallery(context: Context, dngBytes: ByteArray, displayName: String? = null, location: Location? = null): Uri? =
         withContext(Dispatchers.IO) {
             val name = displayName ?: generateFileName()
+            val finalBytes = if (location != null) writeExifGps(context, dngBytes, location) else dngBytes
             val contentValues = ContentValues().apply {
                 put(MediaStore.Images.Media.DISPLAY_NAME, "$name.dng")
                 put(MediaStore.Images.Media.MIME_TYPE, "image/x-adobe-dng")
@@ -86,7 +87,7 @@ object PhotoSaver {
             val uri = resolver.insert(collection, contentValues) ?: return@withContext null
 
             try {
-                resolver.openOutputStream(uri)?.use { it.write(dngBytes); it.flush() }
+                resolver.openOutputStream(uri)?.use { it.write(finalBytes); it.flush() }
                     ?: return@withContext null.also { resolver.delete(uri, null, null) }
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     contentValues.clear()

@@ -106,6 +106,7 @@ private val Surface2 = Color(0xFF252525)
 private val TextPrimary = Color(0xFFFFFFFF)
 private val TextMuted = Color(0xFF8E8E93)
 private val AccentDim = Color(0xFF636366)
+private val AccentGreen = Color(0xFF30D158)
 private val GridColor = Color(0x33FFFFFF)
 private val Danger = Color(0xFFFF453A)
 
@@ -145,6 +146,7 @@ fun CameraScreen() {
     // GPS
     var enableLocation by remember { mutableStateOf(false) }
     var currentLocation by remember { mutableStateOf<Location?>(null) }
+    var isLocationLoading by remember { mutableStateOf(false) }
 
     // RAW
     var enableRaw by remember { mutableStateOf(false) }
@@ -247,6 +249,7 @@ fun CameraScreen() {
 
     LaunchedEffect(enableLocation, hasLocationPermission) {
         if (enableLocation && hasLocationPermission) {
+            isLocationLoading = true
             try {
                 val cts = CancellationTokenSource()
                 currentLocation = suspendCancellableCoroutine { cont ->
@@ -255,7 +258,8 @@ fun CameraScreen() {
                         .addOnFailureListener { cont.resume(null) }
                 }
             } catch (_: SecurityException) { currentLocation = null }
-        } else { currentLocation = null }
+            isLocationLoading = false
+        } else { currentLocation = null; isLocationLoading = false }
     }
 
     LaunchedEffect(showFocusRing) { if (showFocusRing) { delay(1200); showFocusRing = false } }
@@ -305,16 +309,16 @@ fun CameraScreen() {
                         try { RustBridge.autoEnhance(jpegBytes).onSuccess { processedBytes = it } }
                         catch (_: Throwable) {}
 
-                        // 保存 DNG
-                        withContext(Dispatchers.IO) { PhotoSaver.saveDngToGallery(context, dngBytes) }
+                        // 保存 DNG (含 GPS)
+                        withContext(Dispatchers.IO) { PhotoSaver.saveDngToGallery(context, dngBytes, location = currentLocation) }
 
                         withContext(Dispatchers.Main) {
                             Toast.makeText(context, "JPEG + RAW saved", Toast.LENGTH_SHORT).show()
                         }
                     } else {
-                        // RAW 失败，降级到普通 JPEG
+                        // RAW 失败，降级到普通 JPEG 并自动保存
                         withContext(Dispatchers.Main) {
-                            Toast.makeText(context, "RAW failed, taking JPEG", Toast.LENGTH_SHORT).show()
+                            Toast.makeText(context, "RAW failed, saving JPEG", Toast.LENGTH_SHORT).show()
                         }
                         // 重新绑定 CameraX 并用 ImageCapture 拍照
                         val pv = previewViewRef
@@ -328,9 +332,18 @@ fun CameraScreen() {
                                         capturedBytes = jpegBytes; processedBytes = jpegBytes
                                         try { RustBridge.autoEnhance(jpegBytes).onSuccess { processedBytes = it } }
                                         catch (_: Throwable) {}
+                                        // 自动保存 JPEG 到相册
+                                        val uri = withContext(Dispatchers.IO) {
+                                            PhotoSaver.saveJpegToGallery(context, jpegBytes, location = currentLocation)
+                                        }
+                                        withContext(Dispatchers.Main) {
+                                            Toast.makeText(context, if (uri != null) "JPEG saved" else "Save failed", Toast.LENGTH_SHORT).show()
+                                        }
                                     }
                                 }
-                                override fun onError(exception: ImageCaptureException) {}
+                                override fun onError(exception: ImageCaptureException) {
+                                    scope.launch { withContext(Dispatchers.Main) { Toast.makeText(context, "Fallback failed", Toast.LENGTH_SHORT).show() } }
+                                }
                             })
                         }
                     }
@@ -573,8 +586,11 @@ private fun ViewfinderScreen(
             Row(Modifier.align(Alignment.TopEnd).statusBarsPadding().padding(top = 56.dp, end = 16.dp)
                 .background(Surface2.copy(alpha = 0.6f), RoundedCornerShape(10.dp)).padding(horizontal = 8.dp, vertical = 3.dp),
                 verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                Icon(Icons.Default.LocationOn, null, tint = TextMuted, modifier = Modifier.size(12.dp))
-                Text("GPS", color = TextMuted, fontSize = 10.sp, fontWeight = FontWeight.Medium)
+                Icon(Icons.Default.LocationOn, null, tint = if (currentLocation != null) AccentGreen else TextMuted, modifier = Modifier.size(12.dp))
+                Text(
+                    if (isLocationLoading) "定位中..." else if (currentLocation != null) "GPS ✓" else "GPS",
+                    color = if (currentLocation != null) AccentGreen else TextMuted, fontSize = 10.sp, fontWeight = FontWeight.Medium
+                )
             }
         }
 
