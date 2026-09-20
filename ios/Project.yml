@@ -19,6 +19,7 @@ settings:
     CODE_SIGNING_REQUIRED: "NO"
     CODE_SIGNING_ALLOWED: "NO"
     ENABLE_BITCODE: "NO"
+    ARCHS: "arm64"
     SWIFT_OBJC_BRIDGING_HEADER: "CameraApp/CameraApp-Bridging-Header.h"
 
 targets:
