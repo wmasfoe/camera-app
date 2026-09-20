@@ -121,8 +121,7 @@ fn encode_jpeg(img: &RgbImage, quality: u8) -> Result<Vec<u8>, CameraError> {
 
 #[inline(always)]
 fn for_each_pixel(pixels: &mut [u8], mut f: impl FnMut(&mut [u8; 3])) {
-    for chunk in pixels.chunks_exact_mut(3) {
-        let pixel: &mut [u8; 3] = chunk.try_into().unwrap();
+    for pixel in pixels.as_chunks_mut::<3>().0 {
         f(pixel);
     }
 }
@@ -265,7 +264,7 @@ fn apply_auto_contrast(pixels: &mut [u8]) {
     let mut min_lum = 255u8;
     let mut max_lum = 0u8;
 
-    for chunk in pixels.chunks_exact(3) {
+    for chunk in pixels.as_chunks::<3>().0 {
         let l = ((77 * chunk[0] as u32 + 150 * chunk[1] as u32 + 29 * chunk[2] as u32) >> 8) as u8;
         min_lum = min_lum.min(l);
         max_lum = max_lum.max(l);

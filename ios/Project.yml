@@ -1,0 +1,44 @@
+# Project.yml — XcodeGen spec for the iOS Camera App
+# Generate Xcode project: xcodegen generate
+#
+# Install xcodegen: brew install xcodegen
+
+name: CameraApp
+
+options:
+  bundleIdPrefix: com.cameraapp
+  deploymentTarget:
+    iOS: "16.0"
+  generateEmptyDirectories: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    TARGETED_DEVICE_FAMILY: "1,2"
+    CODE_SIGN_IDENTITY: "-"
+    CODE_SIGNING_REQUIRED: "NO"
+    CODE_SIGNING_ALLOWED: "NO"
+    ENABLE_BITCODE: "NO"
+    SWIFT_OBJC_BRIDGING_HEADER: "CameraApp/CameraApp-Bridging-Header.h"
+
+targets:
+  CameraApp:
+    type: application
+    platform: iOS
+    sources:
+      - path: CameraApp
+        excludes:
+          - "Generated/.gitkeep"
+    settings:
+      base:
+        INFOPLIST_FILE: CameraApp/Info.plist
+        PRODUCT_BUNDLE_IDENTIFIER: com.cameraapp.ios
+        PRODUCT_NAME: CameraApp
+        HEADER_SEARCH_PATHS:
+          - "$(SRCROOT)/CameraApp/Generated"
+        OTHER_LDFLAGS:
+          - "-lcamera_shared_core"
+        LIBRARY_SEARCH_PATHS:
+          - "$(SRCROOT)/../target/aarch64-apple-ios/release"
+          - "$(SRCROOT)/../target/universal-sim/release"
+    dependencies: []
