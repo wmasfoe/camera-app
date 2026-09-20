@@ -5,6 +5,7 @@ import android.content.ContentUris
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.ImageFormat
@@ -70,6 +71,7 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
@@ -97,6 +99,7 @@ import java.util.Locale
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
+import kotlin.math.abs
 
 // ── Tokens ───────────────────────────────────────────────────────────
 
@@ -468,6 +471,13 @@ fun CameraScreen() {
 
     fun switchCamera() { isFrontCamera = !isFrontCamera; zoomRatio = 1f; exposureComp = 0f }
 
+    fun setZoomPreset(target: Float) {
+        val cam = camera ?: return
+        zoomRatio = target.coerceIn(cam.cameraInfo.zoomState.value?.minZoomRatio ?: 1f,
+            cam.cameraInfo.zoomState.value?.maxZoomRatio ?: 10f)
+        cam.cameraControl.setZoomRatio(zoomRatio)
+    }
+
     fun openGallery() {
         try { context.startActivity(Intent(Intent.ACTION_VIEW, MediaStore.Images.Media.EXTERNAL_CONTENT_URI).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
         catch (_: Exception) { Toast.makeText(context, "No gallery app", Toast.LENGTH_SHORT).show() }
@@ -519,7 +529,8 @@ fun CameraScreen() {
                 onExposureToggle = { showExposureSlider = !showExposureSlider },
                 onExposureChange = { setExposure(it) },
                 onLocationToggle = { toggleLocation() },
-                onRawToggle = { enableRaw = !enableRaw }
+                onRawToggle = { enableRaw = !enableRaw },
+                onZoomPreset = { setZoomPreset(it) }
             )
         }
     }
@@ -555,8 +566,10 @@ private fun ViewfinderScreen(
     onFlashToggle: () -> Unit, onSwitchCamera: () -> Unit, onModeChange: (Int) -> Unit,
     onGridToggle: () -> Unit, onGalleryClick: () -> Unit,
     onExposureToggle: () -> Unit, onExposureChange: (Float) -> Unit,
-    onLocationToggle: () -> Unit, onRawToggle: () -> Unit
+    onLocationToggle: () -> Unit, onRawToggle: () -> Unit, onZoomPreset: (Float) -> Unit
 ) {
+    val isLandscape = LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
+
     Box(Modifier.fillMaxSize()) {
         Box(Modifier.fillMaxSize().pointerInput(Unit) { detectTransformGestures { _, _, zoom, _ -> if (zoom != 1f) onZoom(zoom) } }) {
             CameraPreviewWithFocus(imageCapture, videoCapture, isFrontCamera, showGrid, showFocusRing, focusPoint,
@@ -571,19 +584,33 @@ private fun ViewfinderScreen(
 
         if (showFlash) Box(Modifier.fillMaxSize().background(Color.White.copy(alpha = 0.7f)))
 
+        // ── 顶部栏 ──
         TopBar(flashMode, showGrid, enableLocation, enableRaw, isRawSupported,
             onFlashToggle, onGridToggle, onExposureToggle, onLocationToggle, onRawToggle,
-            Modifier.align(Alignment.TopStart).statusBarsPadding().padding(horizontal = 16.dp, vertical = 8.dp))
+            Modifier.align(if (isLandscape) Alignment.TopStart else Alignment.TopStart)
+                .statusBarsPadding().padding(horizontal = 16.dp, vertical = 8.dp))
 
+        // ── 变焦倍率显示 ──
         if (zoomRatio > 1.05f) {
             Text("${String.format("%.1f", zoomRatio)}x", color = TextPrimary, fontSize = 13.sp, fontWeight = FontWeight.SemiBold,
                 modifier = Modifier.align(Alignment.TopCenter).statusBarsPadding().padding(top = 64.dp)
                     .background(Surface2.copy(alpha = 0.6f), RoundedCornerShape(10.dp)).padding(horizontal = 10.dp, vertical = 4.dp))
         }
 
-        if (showExposureSlider) ExposureSlider(exposureComp, onExposureChange, Modifier.align(Alignment.CenterEnd).padding(end = 16.dp))
+        // ── 曝光滑块 (方向自适应) ──
+        if (showExposureSlider) {
+            if (isLandscape) {
+                ExposureSlider(exposureComp, onExposureChange, isLandscape = true,
+                    Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(bottom = 100.dp))
+            } else {
+                ExposureSlider(exposureComp, onExposureChange, isLandscape = false,
+                    Modifier.align(Alignment.CenterEnd).padding(end = 12.dp))
+            }
+        }
+
         if (isRecording) RecordingIndicator(recordingDuration, Modifier.align(Alignment.TopCenter).statusBarsPadding().padding(top = 12.dp))
 
+        // ── GPS / RAW 状态标签 ──
         if (enableLocation) {
             Row(Modifier.align(Alignment.TopEnd).statusBarsPadding().padding(top = 56.dp, end = 16.dp)
                 .background(Surface2.copy(alpha = 0.6f), RoundedCornerShape(10.dp)).padding(horizontal = 8.dp, vertical = 3.dp),
@@ -605,9 +632,27 @@ private fun ViewfinderScreen(
             }
         }
 
+        // ── 变焦预设按钮 (iOS 风格) ──
+        Row(Modifier.align(if (isLandscape) Alignment.CenterEnd else Alignment.BottomCenter)
+            .then(if (isLandscape) Modifier.padding(end = 12.dp).navigationBarsPadding() else Modifier.padding(bottom = 140.dp)),
+            horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+            listOf(0.5f to ".5", 1f to "1", 2f to "2", 5f to "5").forEach { (zoom, label) ->
+                val isActive = abs(zoomRatio - zoom) < 0.15f
+                Box(Modifier.size(36.dp)
+                    .background(if (isActive) TextPrimary else Surface2.copy(alpha = 0.7f), CircleShape)
+                    .clickable(remember { MutableInteractionSource() }, null) { onZoomPreset(zoom) },
+                    contentAlignment = Alignment.Center) {
+                    Text(label, color = if (isActive) Bg else TextMuted, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                }
+            }
+        }
+
+        // ── 底部控制 ──
         BottomControls(selectedMode, lastPhotoBitmap, isRecording,
             onModeChange, onShutter, onSwitchCamera, onGalleryClick,
-            Modifier.align(Alignment.BottomStart).navigationBarsPadding().padding(bottom = 24.dp))
+            Modifier.align(if (isLandscape) Alignment.CenterEnd else Alignment.BottomCenter)
+                .then(if (isLandscape) Modifier.padding(end = 12.dp).navigationBarsPadding()
+                else Modifier.navigationBarsPadding().padding(bottom = 16.dp)))
     }
 }
 
@@ -662,11 +707,24 @@ private fun CameraPreviewWithFocus(
     Canvas(Modifier.fillMaxSize()) { drawCircle(color = TextPrimary.copy(alpha = 0.8f), radius = 40f, center = point, style = Stroke(2f)) }
 }
 
-@Composable private fun ExposureSlider(value: Float, onChange: (Float) -> Unit, modifier: Modifier) {
-    Column(modifier.width(36.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-        Icon(Icons.Default.Brightness6, null, tint = TextPrimary, modifier = Modifier.size(16.dp)); Spacer(Modifier.height(8.dp))
-        Slider(value = value, onValueChange = onChange, valueRange = -1f..1f, modifier = Modifier.height(200.dp),
-            colors = SliderDefaults.colors(thumbColor = TextPrimary, activeTrackColor = TextPrimary, inactiveTrackColor = AccentDim))
+@Composable private fun ExposureSlider(value: Float, onChange: (Float) -> Unit, isLandscape: Boolean, modifier: Modifier) {
+    // 竖屏: 右侧垂直滑块 (上=增亮, 下=减暗); 横屏: 底部水平滑块 (右=增亮, 左=减暗)
+    if (isLandscape) {
+        Row(modifier.height(40.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Icon(Icons.Default.Brightness6, null, tint = TextMuted, modifier = Modifier.size(16.dp))
+            Slider(value = value, onValueChange = onChange, valueRange = -1f..1f, modifier = Modifier.width(200.dp),
+                colors = SliderDefaults.colors(thumbColor = TextPrimary, activeTrackColor = TextPrimary, inactiveTrackColor = AccentDim))
+            Text("%.1f".format(value), color = TextMuted, fontSize = 11.sp, fontWeight = FontWeight.Medium, modifier = Modifier.width(30.dp))
+        }
+    } else {
+        Column(modifier.width(44.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+            Text("%.1f".format(value), color = TextMuted, fontSize = 10.sp, fontWeight = FontWeight.Medium)
+            Spacer(Modifier.height(4.dp))
+            Slider(value = value, onValueChange = onChange, valueRange = -1f..1f, modifier = Modifier.height(180.dp),
+                colors = SliderDefaults.colors(thumbColor = TextPrimary, activeTrackColor = TextPrimary, inactiveTrackColor = AccentDim))
+            Spacer(Modifier.height(4.dp))
+            Icon(Icons.Default.Brightness6, null, tint = TextMuted, modifier = Modifier.size(16.dp))
+        }
     }
 }
 
@@ -699,30 +757,48 @@ private fun CameraPreviewWithFocus(
 
 @Composable private fun BottomControls(selectedMode: Int, lastPhotoBitmap: Bitmap?, isRecording: Boolean,
     onModeChange: (Int) -> Unit, onShutter: () -> Unit, onSwitchCamera: () -> Unit, onGalleryClick: () -> Unit, modifier: Modifier) {
-    val modes = listOf("Video", "Photo", "Portrait")
+    val modes = listOf("VIDEO", "PHOTO", "PORTRAIT")
     Column(modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
+        // 模式选择器
         Row(horizontalArrangement = Arrangement.spacedBy(20.dp), verticalAlignment = Alignment.CenterVertically) {
-            modes.forEachIndexed { i, label -> Text(label.uppercase(), color = if (i == selectedMode) TextPrimary else TextMuted,
-                fontSize = 12.sp, fontWeight = FontWeight.Medium, letterSpacing = 0.3.sp,
-                modifier = Modifier.clickable(remember { MutableInteractionSource() }, null) { onModeChange(i) }) }
+            modes.forEachIndexed { i, label ->
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(label, color = if (i == selectedMode) TextPrimary else TextMuted,
+                        fontSize = 12.sp, fontWeight = if (i == selectedMode) FontWeight.Bold else FontWeight.Medium,
+                        letterSpacing = 0.5.sp,
+                        modifier = Modifier.clickable(remember { MutableInteractionSource() }, null) { onModeChange(i) })
+                    if (i == selectedMode) {
+                        Spacer(Modifier.height(3.dp))
+                        Box(Modifier.width(20.dp).height(2.dp).background(TextPrimary, RoundedCornerShape(1.dp)))
+                    } else Spacer(Modifier.height(5.dp))
+                }
+            }
         }
         Spacer(Modifier.height(20.dp))
+        // 底部: 相册 / 快门 / 切换
         Row(Modifier.fillMaxWidth().padding(horizontal = 32.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-            Box(Modifier.size(42.dp).background(Surface2, RoundedCornerShape(8.dp)).clickable(remember { MutableInteractionSource() }, null) { onGalleryClick() }, contentAlignment = Alignment.Center) {
-                if (lastPhotoBitmap != null) Image(lastPhotoBitmap.asImageBitmap(), null, Modifier.size(42.dp).clip(RoundedCornerShape(8.dp)), contentScale = ContentScale.Crop)
+            // 相册缩略图
+            Box(Modifier.size(42.dp).background(Surface2, RoundedCornerShape(10.dp))
+                .clickable(remember { MutableInteractionSource() }, null) { onGalleryClick() }, contentAlignment = Alignment.Center) {
+                if (lastPhotoBitmap != null) Image(lastPhotoBitmap.asImageBitmap(), null, Modifier.size(42.dp).clip(RoundedCornerShape(10.dp)), contentScale = ContentScale.Crop)
                 else Icon(Icons.Default.GridOn, null, tint = TextMuted, modifier = Modifier.size(20.dp))
             }
+            // 快门按钮
             if (selectedMode == 0) {
+                // 录像: 红色圆点/方块
                 Box(Modifier.size(72.dp).border(3.dp, if (isRecording) Danger else TextPrimary, CircleShape)
                     .clickable(remember { MutableInteractionSource() }, null) { onShutter() }, contentAlignment = Alignment.Center) {
-                    if (isRecording) Box(Modifier.size(28.dp).background(Danger, RoundedCornerShape(4.dp)))
+                    if (isRecording) Box(Modifier.size(28.dp).background(Danger, RoundedCornerShape(6.dp)))
                     else Box(Modifier.size(60.dp).background(Danger, CircleShape))
                 }
             } else {
-                Box(Modifier.size(72.dp).border(3.dp, TextPrimary, CircleShape).clickable(remember { MutableInteractionSource() }, null) { onShutter() }, contentAlignment = Alignment.Center) {
+                // 拍照: 白色圆环 + 内圆
+                Box(Modifier.size(72.dp).border(3.dp, TextPrimary, CircleShape)
+                    .clickable(remember { MutableInteractionSource() }, null) { onShutter() }, contentAlignment = Alignment.Center) {
                     Box(Modifier.size(60.dp).background(TextPrimary, CircleShape))
                 }
             }
+            // 前后摄切换
             CircleIconButton(Icons.Default.Cameraswitch, TextPrimary, size = 42, onClick = onSwitchCamera)
         }
     }
