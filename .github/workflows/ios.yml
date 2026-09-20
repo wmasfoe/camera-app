@@ -24,7 +24,7 @@ jobs:
   # ── Rust → iOS static library + UniFFI bindings ──────────────────
   rust-ios:
     name: Rust → iOS (.a + Swift)
-    runs-on: macos-15
+    runs-on: macos-15-xlarge
     steps:
       - uses: actions/checkout@v4
 
@@ -110,7 +110,7 @@ jobs:
   # ── iOS App Build ─────────────────────────────────────────────────
   ios-build:
     name: iOS App Build
-    runs-on: macos-15
+    runs-on: macos-15-xlarge
     needs: rust-ios
     steps:
       - uses: actions/checkout@v4
@@ -150,7 +150,7 @@ jobs:
           xcodebuild build \
             -project CameraApp.xcodeproj \
             -scheme CameraApp \
-            -destination 'generic/platform=iOS Simulator' \
+            -destination 'generic/platform=iOS Simulator,arch=arm64' \
             -configuration Release \
             -derivedDataPath build \
             CODE_SIGN_IDENTITY="" \
