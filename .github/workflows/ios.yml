@@ -119,13 +119,13 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: ios-device-lib
-          path: shared-core/target/aarch64-apple-ios/release/
+          path: target/aarch64-apple-ios/release/
 
       - name: Download simulator library
         uses: actions/download-artifact@v4
         with:
           name: ios-sim-lib
-          path: shared-core/target/universal-sim/release/
+          path: target/universal-sim/release/
 
       - name: Download Swift bindings
         uses: actions/download-artifact@v4
