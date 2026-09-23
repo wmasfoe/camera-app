@@ -41,4 +41,7 @@ targets:
           - "-lcamera_shared_core"
         LIBRARY_SEARCH_PATHS:
           - "$(SRCROOT)/../target/universal-sim/release"
+        # 真机构建用 device .a，模拟器构建用 universal-sim .a（sdk 条件隔离，互不干扰）
+        LIBRARY_SEARCH_PATHS[sdk=iphoneos*]:
+          - "$(SRCROOT)/../target/aarch64-apple-ios/release"
     dependencies: []
