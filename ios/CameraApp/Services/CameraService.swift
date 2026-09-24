@@ -26,6 +26,9 @@ class CameraService: NSObject, ObservableObject {
     @Published var isRecording = false
     @Published var recordingDuration: TimeInterval = 0
 
+    // 前后置状态（供预览镜像用，切换前后置时更新）
+    @Published var cameraPosition: AVCaptureDevice.Position = .back
+
     // MARK: - Session & Devices
 
     let session = AVCaptureSession()
@@ -44,6 +47,12 @@ class CameraService: NSObject, ObservableObject {
 
     override init() {
         super.init()
+        // 监听设备方向，供预览/拍摄方向跟随使用
+        UIDevice.current.beginGeneratingDeviceOrientationNotifications()
+    }
+
+    deinit {
+        UIDevice.current.endGeneratingDeviceOrientationNotifications()
     }
 
     // MARK: - Permission
@@ -280,6 +289,13 @@ class CameraService: NSObject, ObservableObject {
 
         settings.isHighResolutionPhotoEnabled = true
 
+        // 拍摄方向跟随当前设备方向（否则前置/横屏成片方向错误）
+        if let connection = photoOutput.connection(with: .video),
+           connection.isVideoOrientationSupported,
+           let orientation = Self.videoOrientation(for: UIDevice.current.orientation) {
+            connection.videoOrientation = orientation
+        }
+
         // Enable lens correction if available
         if #available(iOS 17.0, *) {
             // Lens stabilization not available on all devices
@@ -337,6 +353,7 @@ class CameraService: NSObject, ObservableObject {
     /// Switch between front and back camera
     func switchCamera() {
         currentPosition = currentPosition == .back ? .front : .back
+        cameraPosition = currentPosition
         currentZoomFactor = 1.0
         exposureCompensation = 0.0
 
@@ -458,6 +475,24 @@ class CameraService: NSObject, ObservableObject {
 
     func markProcessingDone() {
         isCapturing = false
+    }
+
+    // MARK: - Orientation
+
+    /// 设备方向 → 视频方向（前后置通用；faceUp/faceDown/unknown 返回 nil，保持上次方向）
+    static func videoOrientation(for deviceOrientation: UIDeviceOrientation) -> AVCaptureVideoOrientation? {
+        switch deviceOrientation {
+        case .portrait:
+            return .portrait
+        case .portraitUpsideDown:
+            return .portraitUpsideDown
+        case .landscapeLeft:
+            return .landscapeRight
+        case .landscapeRight:
+            return .landscapeLeft
+        default:
+            return nil
+        }
     }
 }
 

@@ -23,6 +23,8 @@ struct ViewfinderView: View {
     @State private var showShutterFlash = false
     @State private var lastPhotoThumbnail: UIImage?
     @State private var currentZoomDisplay: String = ""
+    // 设备方向（驱动预览方向跟随旋转）
+    @State private var deviceOrientation = UIDevice.current.orientation
 
     // Callbacks
     let onShutter: () -> Void
@@ -63,20 +65,20 @@ struct ViewfinderView: View {
                 if cameraService.isRecording {
                     recordingIndicator
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-                        .padding(.top, 60)
+                        .padding(.top, geometry.safeAreaInsets.top + 12)
                 }
 
                 // Zoom factor display
                 if cameraService.currentZoomFactor > 1.05 {
                     zoomBadge
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-                        .padding(.top, 56)
+                        .padding(.top, geometry.safeAreaInsets.top + 12)
                 }
 
                 // Status badges (GPS, RAW)
                 statusBadges
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
-                    .padding(.top, 56)
+                    .padding(.top, geometry.safeAreaInsets.top + 12)
                     .padding(.trailing, 16)
 
                 // Layout-specific controls
@@ -90,12 +92,19 @@ struct ViewfinderView: View {
         .onAppear {
             loadLastThumbnail()
         }
+        .onReceive(NotificationCenter.default.publisher(for: UIDevice.orientationDidChangeNotification)) { _ in
+            deviceOrientation = UIDevice.current.orientation
+        }
     }
 
     // MARK: - Camera Preview Layer
 
     private func cameraPreviewLayer(in geometry: GeometryProxy) -> some View {
-        CameraPreviewUIView(session: cameraService.session)
+        CameraPreviewUIView(
+            session: cameraService.session,
+            position: cameraService.cameraPosition,
+            deviceOrientation: deviceOrientation
+        )
             .ignoresSafeArea()
             .contentShape(Rectangle())
             .onTapGesture(count: 1) { location in
@@ -121,10 +130,10 @@ struct ViewfinderView: View {
 
     private func portraitLayout(geometry: GeometryProxy) -> some View {
         VStack(spacing: 0) {
-            // Top bar
+            // Top bar（避开刘海/灵动岛：safeArea 顶部 + 8）
             topBar
                 .padding(.horizontal, 16)
-                .padding(.top, 8)
+                .padding(.top, geometry.safeAreaInsets.top + 8)
 
             Spacer()
 
@@ -149,175 +158,173 @@ struct ViewfinderView: View {
         }
     }
 
-    // MARK: - Landscape Layout
+    // MARK: - Landscape Layout（横屏重构：左侧竖排开关 + 底部横排控制条，复用竖屏组件）
 
     private func landscapeLayout(geometry: GeometryProxy) -> some View {
-        HStack(spacing: 0) {
-            // Top-left: flash, grid, exposure, location
-            VStack {
-                topBar
-                    .padding(.horizontal, 12)
-                    .padding(.top, 8)
+        ZStack {
+            // 左侧竖排快捷开关（避开刘海，刘海在横屏时位于侧边）
+            HStack(spacing: 0) {
+                VStack {
+                    landscapeSideBar
+                    Spacer()
+                }
+                .padding(.leading, geometry.safeAreaInsets.leading + 12)
+                .padding(.top, max(geometry.safeAreaInsets.top, 8))
+
                 Spacer()
             }
 
-            Spacer()
+            // 底部横排控制条（复用竖屏 bottomControls：变焦 + 模式 + 快门/切换）
+            VStack(spacing: 10) {
+                Spacer()
 
-            // Bottom: exposure slider horizontal
-            if showExposureSlider {
-                VStack {
-                    Spacer()
+                if showExposureSlider {
                     exposureSlider(isLandscape: true)
-                        .padding(.bottom, 12)
+                        .padding(.bottom, 8)
                 }
+
+                zoomPresets
+
+                bottomControls
             }
-
-            Spacer()
-
-            // Right side controls
-            VStack(spacing: 16) {
-                // Zoom presets (vertical)
-                VStack(spacing: 6) {
-                    ForEach(ZoomPreset.defaults) { preset in
-                        zoomPresetButton(preset: preset)
-                    }
-                }
-
-                Divider_()
-
-                // Mode selector (vertical)
-                ForEach(CaptureMode.allCases) { mode in
-                    modeButton(mode: mode, vertical: true)
-                }
-
-                Divider_()
-
-                // Shutter
-                shutterButton
-
-                Divider_()
-
-                // Lens cycle
-                if cameraService.backCameraCount > 1 {
-                    circleIconButton(systemName: "camera.aperture", tint: CameraTokens.swiftAccentGreen) {
-                        onCycleLens()
-                    }
-                }
-
-                // Switch camera
-                circleIconButton(systemName: "camera.rotate.fill", tint: CameraTokens.swiftTextPrimary) {
-                    onSwitchCamera()
-                }
-            }
-            .padding(.trailing, 12)
-            .padding(.vertical, 16)
+            .padding(.bottom, geometry.safeAreaInsets.bottom + 12)
         }
     }
 
-    // MARK: - Top Bar
+    // MARK: - Top Bar（横/竖屏共用的开关按钮）
+
+    private var flashButton: some View {
+        circleIconButton(systemName: flashMode.iconName, tint: flashMode == .off ? CameraTokens.swiftAccentDim : CameraTokens.swiftTextMuted) {
+            flashMode.cycle()
+        }
+    }
+
+    private var gridButton: some View {
+        circleIconButton(systemName: "grid", tint: showGrid ? CameraTokens.swiftTextPrimary : CameraTokens.swiftTextMuted) {
+            showGrid.toggle()
+        }
+    }
+
+    private var exposureButton: some View {
+        circleIconButton(systemName: "sun.max.fill", tint: CameraTokens.swiftTextMuted) {
+            withAnimation(.easeInOut(duration: 0.2)) {
+                showExposureSlider.toggle()
+            }
+        }
+    }
+
+    private var locationButton: some View {
+        circleIconButton(systemName: "location.fill", tint: enableLocation ? CameraTokens.swiftTextPrimary : CameraTokens.swiftTextMuted) {
+            if enableLocation {
+                enableLocation = false
+                locationService.disable()
+            } else {
+                enableLocation = true
+                locationService.enable()
+            }
+        }
+    }
+
+    private var rawButton: some View {
+        Group {
+            if cameraService.isRawSupported {
+                Button {
+                    enableRaw.toggle()
+                } label: {
+                    Text("R")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundColor(enableRaw ? CameraTokens.swiftTextPrimary : CameraTokens.swiftTextMuted)
+                        .frame(width: 36, height: 36)
+                        .background(Circle().fill(CameraTokens.swiftSurface2.opacity(0.6)))
+                }
+            }
+        }
+    }
 
     private var topBar: some View {
         HStack {
-            // Flash toggle
-            circleIconButton(systemName: flashMode.iconName, tint: flashMode == .off ? CameraTokens.swiftAccentDim : CameraTokens.swiftTextMuted) {
-                flashMode.cycle()
-            }
+            flashButton
 
             Spacer()
 
             HStack(spacing: 6) {
-                // Grid toggle
-                circleIconButton(systemName: "grid", tint: showGrid ? CameraTokens.swiftTextPrimary : CameraTokens.swiftTextMuted) {
-                    showGrid.toggle()
-                }
-
-                // Exposure toggle
-                circleIconButton(systemName: "sun.max.fill", tint: CameraTokens.swiftTextMuted) {
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        showExposureSlider.toggle()
-                    }
-                }
-
-                // Location toggle
-                circleIconButton(systemName: "location.fill", tint: enableLocation ? CameraTokens.swiftTextPrimary : CameraTokens.swiftTextMuted) {
-                    if enableLocation {
-                        enableLocation = false
-                        locationService.disable()
-                    } else {
-                        enableLocation = true
-                        locationService.enable()
-                    }
-                }
-
-                // RAW toggle
-                if cameraService.isRawSupported {
-                    Button {
-                        enableRaw.toggle()
-                    } label: {
-                        Text("R")
-                            .font(.system(size: 11, weight: .bold))
-                            .foregroundColor(enableRaw ? CameraTokens.swiftTextPrimary : CameraTokens.swiftTextMuted)
-                            .frame(width: 36, height: 36)
-                            .background(Circle().fill(CameraTokens.swiftSurface2.opacity(0.6)))
-                    }
-                }
+                gridButton
+                exposureButton
+                locationButton
+                rawButton
             }
+        }
+    }
+
+    /// 横屏左侧竖排开关栏（与 topBar 同一组按钮）
+    private var landscapeSideBar: some View {
+        VStack(spacing: 12) {
+            flashButton
+            gridButton
+            exposureButton
+            locationButton
+            rawButton
         }
     }
 
     // MARK: - Bottom Controls
 
     private var bottomControls: some View {
-        HStack {
-            // Gallery thumbnail
-            Button {
-                // Open Photos app
-                if let url = URL(string: "photos-redirect://") {
-                    UIApplication.shared.open(url)
-                }
-            } label: {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 10)
-                        .fill(CameraTokens.swiftSurface2)
-                        .frame(width: 42, height: 42)
-
-                    if let thumbnail = lastPhotoThumbnail {
-                        Image(uiImage: thumbnail)
-                            .resizable()
-                            .aspectRatio(contentMode: .fill)
-                            .frame(width: 42, height: 42)
-                            .clipShape(RoundedRectangle(cornerRadius: 10))
-                    } else {
-                        Image(systemName: "photo.on.rectangle")
-                            .font(.system(size: 20))
-                            .foregroundColor(CameraTokens.swiftTextMuted)
-                    }
-                }
-            }
-
-            Spacer()
-
-            // Mode selector
+        VStack(spacing: 10) {
+            // Mode selector（居中独立一行，对齐原生相机）
             HStack(spacing: 20) {
                 ForEach(CaptureMode.allCases) { mode in
-                    modeButton(mode: mode, vertical: false)
+                    modeButton(mode: mode)
                 }
             }
 
-            Spacer()
+            HStack {
+                // Gallery thumbnail
+                Button {
+                    // Open Photos app
+                    if let url = URL(string: "photos-redirect://") {
+                        UIApplication.shared.open(url)
+                    }
+                } label: {
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 10)
+                            .fill(CameraTokens.swiftSurface2)
+                            .frame(width: 42, height: 42)
 
-            // Shutter + Camera Switch
-            HStack(spacing: 12) {
-                // Lens cycle button
-                if cameraService.backCameraCount > 1 {
-                    circleIconButton(systemName: "camera.aperture", tint: CameraTokens.swiftAccentGreen, size: 38) {
-                        onCycleLens()
+                        if let thumbnail = lastPhotoThumbnail {
+                            Image(uiImage: thumbnail)
+                                .resizable()
+                                .aspectRatio(contentMode: .fill)
+                                .frame(width: 42, height: 42)
+                                .clipShape(RoundedRectangle(cornerRadius: 10))
+                        } else {
+                            Image(systemName: "photo.on.rectangle")
+                                .font(.system(size: 20))
+                                .foregroundColor(CameraTokens.swiftTextMuted)
+                        }
                     }
                 }
 
-                // Switch camera
-                circleIconButton(systemName: "camera.rotate.fill", tint: CameraTokens.swiftTextPrimary, size: 42) {
-                    onSwitchCamera()
+                Spacer()
+
+                // Shutter（居中快门，两向共用）
+                shutterButton
+
+                Spacer()
+
+                // Shutter + Camera Switch
+                HStack(spacing: 12) {
+                    // Lens cycle button
+                    if cameraService.backCameraCount > 1 {
+                        circleIconButton(systemName: "camera.aperture", tint: CameraTokens.swiftAccentGreen, size: 38) {
+                            onCycleLens()
+                        }
+                    }
+
+                    // Switch camera
+                    circleIconButton(systemName: "camera.rotate.fill", tint: CameraTokens.swiftTextPrimary, size: 42) {
+                        onSwitchCamera()
+                    }
                 }
             }
         }
@@ -326,7 +333,7 @@ struct ViewfinderView: View {
 
     // MARK: - Mode Button
 
-    private func modeButton(mode: CaptureMode, vertical: Bool) -> some View {
+    private func modeButton(mode: CaptureMode) -> some View {
         Button {
             if cameraService.isRecording && mode != .video {
                 cameraService.stopRecording()
@@ -643,30 +650,40 @@ struct FocusRingView: View {
     }
 }
 
-// MARK: - Divider (vertical in landscape)
-
-private struct Divider_: View {
-    var body: some View {
-        Rectangle()
-            .fill(CameraTokens.swiftAccentDim.opacity(0.3))
-            .frame(width: 24, height: 1)
-    }
-}
-
 // MARK: - Camera Preview UIViewRepresentable
 
 struct CameraPreviewUIView: UIViewRepresentable {
     let session: AVCaptureSession
+    let position: AVCaptureDevice.Position
+    let deviceOrientation: UIDeviceOrientation
 
     func makeUIView(context: Context) -> PreviewUIView {
         let view = PreviewUIView()
         view.previewLayer.session = session
+        // 等比填充全屏（本身不变形）；方向与镜像在每次更新时校准
         view.previewLayer.videoGravity = .resizeAspectFill
+        updatePreviewConnection(view.previewLayer)
         return view
     }
 
     func updateUIView(_ uiView: PreviewUIView, context: Context) {
         uiView.previewLayer.frame = uiView.bounds
+        updatePreviewConnection(uiView.previewLayer)
+    }
+
+    /// 校准预览方向与前后置镜像（切换前后置 / 旋转屏幕时生效）
+    private func updatePreviewConnection(_ layer: AVCaptureVideoPreviewLayer) {
+        guard let connection = layer.connection else { return }
+        // 预览方向跟随设备
+        if connection.isVideoOrientationSupported,
+           let orientation = CameraService.videoOrientation(for: deviceOrientation) {
+            connection.videoOrientation = orientation
+        }
+        // 前置镜像与 iOS 原生相机一致；后置关闭镜像
+        if connection.isVideoMirroringSupported {
+            connection.automaticallyAdjustsVideoMirroring = false
+            connection.isVideoMirrored = (position == .front)
+        }
     }
 }
 
