@@ -13,38 +13,40 @@ struct ReviewView: View {
     @State private var selectedFilter: FilterType = .none
 
     var body: some View {
-        ZStack {
-            CameraTokens.swiftBg.ignoresSafeArea()
+        GeometryReader { geometry in
+            ZStack {
+                CameraTokens.swiftBg.ignoresSafeArea()
 
-            // Photo display
-            if let uiImage = UIImage(data: imageData) {
-                Image(uiImage: uiImage)
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
-                    .ignoresSafeArea()
-            }
-
-            // Processing badge
-            if isProcessing {
-                processingBadge
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-                    .padding(.top, 60)
-            }
-
-            // Bottom controls
-            VStack {
-                Spacer()
-
-                VStack(spacing: 0) {
-                    // Filter selector
-                    filterSelector
-
-                    Spacer().frame(height: 16)
-
-                    // Retake / Save buttons
-                    actionButtons
+                // Photo display
+                if let uiImage = UIImage(data: imageData) {
+                    Image(uiImage: uiImage)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .ignoresSafeArea()
                 }
-                .padding(.bottom, 32)
+
+                // Processing badge
+                if isProcessing {
+                    processingBadge
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                        .padding(.top, geometry.safeAreaInsets.top + 12)
+                }
+
+                // Bottom controls
+                VStack {
+                    Spacer()
+
+                    VStack(spacing: 0) {
+                        // Filter selector
+                        filterSelector
+
+                        Spacer().frame(height: 16)
+
+                        // Retake / Save buttons
+                        actionButtons
+                    }
+                    .padding(.bottom, geometry.safeAreaInsets.bottom + 16)
+                }
             }
         }
     }
